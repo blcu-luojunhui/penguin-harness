@@ -8,6 +8,7 @@ import { SIDEBAR_GROUP_PAGE_SIZE, SIDEBAR_PAGE_SIZE } from "../src/lib/session-g
 import {
   TRACES_GROUP_PAGE_SIZE,
   TRACES_PAGE_SIZE,
+  logicalTraceSelection,
   partitionTraceRows,
   toSessionGroups,
 } from "../src/features/traces/trace-sessions";
@@ -58,6 +59,32 @@ describe("toSessionGroups", () => {
     expect(groups[1]!.title).toBeUndefined();
   });
 
+  it("keeps a protocol-v3 Session visible when it has logical roots but no legacy files", () => {
+    const res: AgentTracesResponse = {
+      dates: [],
+      sessions: [
+        {
+          sessionId: S2,
+          title: "Logical Trace only",
+          category: "active",
+          workspace: "/ws/one",
+          files: [],
+        },
+      ],
+      totalSessions: 1,
+    };
+
+    expect(toSessionGroups(res)).toEqual([
+      {
+        sessionId: S2,
+        title: "Logical Trace only",
+        category: "active",
+        workspace: "/ws/one",
+        files: [],
+      },
+    ]);
+  });
+
   it("legacy response: flattens date groups (merging a Session's files across dates), Sessions sorted by id descending, classification defaulted", () => {
     const res: AgentTracesResponse = {
       dates: [
@@ -81,6 +108,28 @@ describe("toSessionGroups", () => {
     // No classification in the legacy shape: rows default to the active bucket / unknown workspace.
     expect(groups[0]!.category).toBe("active");
     expect(groups[0]!.workspace).toBe("");
+  });
+});
+
+describe("logicalTraceSelection", () => {
+  it("opens a supported v3 deep link without requiring a legacy Trace file", () => {
+    expect(
+      logicalTraceSelection("agent-1", "session-1", {
+        supported: true,
+        protocolVersion: 3,
+        roots: [],
+      }),
+    ).toEqual({ agentId: "agent-1", sessionId: "session-1", files: [] });
+  });
+
+  it("leaves unsupported legacy Sessions to the file-list fallback", () => {
+    expect(
+      logicalTraceSelection("agent-1", "session-1", {
+        supported: false,
+        protocolVersion: null,
+        roots: [],
+      }),
+    ).toBeNull();
   });
 });
 

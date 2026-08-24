@@ -200,6 +200,45 @@ export async function writeTraceFile(
   return file;
 }
 
+/** Writes the protocol-v3 Session journal used as the logical Trace inventory. */
+export async function writeLogicalTraceJournal(
+  root: string,
+  projectId: string,
+  agentId: string,
+  sessionId: string,
+  records: unknown[],
+): Promise<string> {
+  const dir = path.join(root, projectId, "agents", agentId, "traces", sessionId);
+  await fs.mkdir(dir, { recursive: true });
+  const file = path.join(dir, "session.jsonl");
+  await fs.writeFile(
+    file,
+    records.map((record) => JSON.stringify(record)).join("\n") + "\n",
+    "utf8",
+  );
+  return file;
+}
+
+/** Writes one protocol-v3 logical root's append-only event stream. */
+export async function writeLogicalTraceEvents(
+  root: string,
+  projectId: string,
+  agentId: string,
+  sessionId: string,
+  traceId: string,
+  records: unknown[],
+): Promise<string> {
+  const dir = path.join(root, projectId, "agents", agentId, "traces", sessionId, "traces", traceId);
+  await fs.mkdir(dir, { recursive: true });
+  const file = path.join(dir, "events.jsonl");
+  await fs.writeFile(
+    file,
+    records.map((record) => JSON.stringify(record)).join("\n") + "\n",
+    "utf8",
+  );
+  return file;
+}
+
 /** Simple wait: until the condition is true or it times out. */
 export async function waitFor(cond: () => boolean, timeoutMs = 2000): Promise<void> {
   const start = Date.now();

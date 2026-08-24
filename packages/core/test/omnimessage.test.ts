@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   PartialAggregator,
+  OMNI_PROTOCOL_VERSION,
   aggregateAll,
   abortEvent,
   addTokenCounts,
@@ -8,12 +9,16 @@ import {
   assistantText,
   emptyTokenCounts,
   isCompleteModelMessage,
+  observation,
   partialText,
   partialToolCall,
   partialToolCallOutput,
+  spanBegin,
+  spanEnd,
   toolCall,
   toolCallOutput,
   userText,
+  withTraceContext,
 } from "../src/omnimessage/index.js";
 import type {
   TextPayload,
@@ -28,6 +33,79 @@ describe("builders", () => {
     expect(m.payload.type).toBe("text");
     expect(m.payload.role).toBe("user");
     expect(new Date(m.timestamp).toISOString()).toBe(m.timestamp);
+    expect(m.protocol_version).toBe(OMNI_PROTOCOL_VERSION);
+    expect(m.event_id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+  });
+
+  it("builds Span lifecycle and explicit observation events with stable Trace context", () => {
+    const traceId = "trace-1";
+    const taskId = "task-1";
+    const stepId = "step-1";
+    const requestId = "request-1";
+    const attemptId = "attempt-1";
+    const begin = spanBegin({
+      kind: "llm.attempt",
+      traceId,
+      taskId,
+      stepId,
+      spanId: attemptId,
+      parentSpanId: requestId,
+      attributes: { input_event_ids: ["input-1"], attempt: 2 },
+    });
+
+    expect(begin.payload).toEqual({
+      type: "span_begin",
+      span_kind: "llm.attempt",
+      capabilities: {
+        editable_input: false,
+        repeatable: true,
+        rerunnable: false,
+        skippable: false,
+      },
+      attributes: { input_event_ids: ["input-1"], attempt: 2 },
+    });
+    expect(begin.trace).toEqual({
+      trace_id: traceId,
+      task_id: taskId,
+      step_id: stepId,
+      span_id: attemptId,
+      parent_span_id: requestId,
+    });
+
+    const end = spanEnd({
+      kind: "llm.attempt",
+      traceId,
+      taskId,
+      stepId,
+      spanId: attemptId,
+      parentSpanId: requestId,
+      status: "skipped",
+    });
+    expect(end.payload).toMatchObject({
+      type: "span_end",
+      span_kind: "llm.attempt",
+      status: "skipped",
+    });
+
+    const observed = withTraceContext(
+      observation({ kind: "planning", content: "Inspect the failing request." }),
+      {
+        trace_id: traceId,
+        task_id: taskId,
+        step_id: stepId,
+        span_id: attemptId,
+        parent_span_id: requestId,
+      },
+    );
+    expect(observed.payload).toEqual({
+      type: "observation",
+      kind: "planning",
+      content: "Inspect the failing request.",
+    });
+    expect(observed.trace?.span_id).toBe(attemptId);
+    expect(new Set([begin.event_id, end.event_id, observed.event_id]).size).toBe(3);
   });
 
   it("builds event messages", () => {

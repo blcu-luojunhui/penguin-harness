@@ -24,6 +24,8 @@ import type {
   McpServerConnectResult,
   MessageOrigin,
   ModelMessage,
+  ObservationKind,
+  ObservationPayload,
   OmniMessage,
   PartialTextPayload,
   PartialThinkingPayload,
@@ -35,6 +37,11 @@ import type {
   SessionMetaMessage,
   SessionMetaPayload,
   McpConnectStatus,
+  SpanBeginPayload,
+  SpanCapabilities,
+  SpanEndPayload,
+  SpanKind,
+  SpanStatus,
   StopReason,
   StreamEventType,
   SubagentPayload,
@@ -46,6 +53,11 @@ import type {
   ToolListReadyPayload,
   ToolCallPayload,
   ToolDefinition,
+  TraceBeginPayload,
+  TraceContext,
+  TraceEndPayload,
+  TraceRootKind,
+  TraceStatus,
 } from "./types.js";
 
 /** The current moment's ISO 8601 UTC timestamp. */
@@ -53,18 +65,40 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+/** Current OmniMessage envelope revision written by every builder. */
+export const OMNI_PROTOCOL_VERSION = 3;
+
+/** Creates an opaque protocol identity. IDs deliberately carry no ordering or business meaning. */
+export function createProtocolId(): string {
+  return globalThis.crypto.randomUUID();
+}
+
+/** Adds the v3 identity fields when an injected/unversioned message does not already have them. */
+export function withProtocolIdentity<M extends OmniMessage>(msg: M): M {
+  if (msg.protocol_version === OMNI_PROTOCOL_VERSION && msg.event_id !== undefined) return msg;
+  return {
+    ...msg,
+    protocol_version: OMNI_PROTOCOL_VERSION,
+    event_id: msg.event_id ?? createProtocolId(),
+  };
+}
+
+function identity(): Pick<OmniMessage, "protocol_version" | "event_id"> {
+  return { protocol_version: OMNI_PROTOCOL_VERSION, event_id: createProtocolId() };
+}
+
 function model<P extends ModelMessage["payload"]>(payload: P): OmniMessage<P> {
-  return { timestamp: nowIso(), type: "model_msg", payload };
+  return { timestamp: nowIso(), ...identity(), type: "model_msg", payload };
 }
 
 function event<P extends EventMessage["payload"]>(payload: P): OmniMessage<P> {
-  return { timestamp: nowIso(), type: "event_msg", payload };
+  return { timestamp: nowIso(), ...identity(), type: "event_msg", payload };
 }
 
 // session_meta ---------------------------------------------------------------
 
 export function sessionMeta(payload: SessionMetaPayload): SessionMetaMessage {
-  return { timestamp: nowIso(), type: "session_meta", payload };
+  return { timestamp: nowIso(), ...identity(), type: "session_meta", payload };
 }
 
 // Complete model_msg -----------------------------------------------------------
@@ -261,6 +295,130 @@ export function partialToolCallOutput(args: {
 
 // event_msg -------------------------------------------------------------------
 
+const NO_SPAN_CAPABILITIES: SpanCapabilities = {
+  editable_input: false,
+  repeatable: false,
+  rerunnable: false,
+  skippable: false,
+};
+
+function capabilitiesFor(kind: SpanKind, overrides?: Partial<SpanCapabilities>): SpanCapabilities {
+  const capabilities = { ...NO_SPAN_CAPABILITIES, ...overrides };
+  if (kind === "llm.attempt") {
+    capabilities.repeatable = true;
+    capabilities.skippable = false;
+  }
+  return capabilities;
+}
+
+/** Opens a logical Trace root. */
+export function traceBegin(args: {
+  rootKind: TraceRootKind;
+  traceId: string;
+  taskId?: string;
+}): OmniMessage<TraceBeginPayload> {
+  return withTraceContext(event({ type: "trace_begin", root_kind: args.rootKind }), {
+    trace_id: args.traceId,
+    ...(args.taskId !== undefined ? { task_id: args.taskId } : {}),
+  });
+}
+
+/** Closes a logical Trace root. */
+export function traceEnd(args: {
+  rootKind: TraceRootKind;
+  traceId: string;
+  taskId?: string;
+  status: TraceStatus;
+  errorMessage?: string;
+}): OmniMessage<TraceEndPayload> {
+  return withTraceContext(
+    event({
+      type: "trace_end",
+      root_kind: args.rootKind,
+      status: args.status,
+      ...(args.errorMessage !== undefined ? { error_message: args.errorMessage } : {}),
+    }),
+    {
+      trace_id: args.traceId,
+      ...(args.taskId !== undefined ? { task_id: args.taskId } : {}),
+    },
+  );
+}
+
+/** Opens an execution Span. Its identity and parentage live in the envelope Trace context. */
+export function spanBegin(args: {
+  kind: SpanKind;
+  traceId: string;
+  taskId?: string;
+  stepId?: string;
+  spanId: string;
+  parentSpanId?: string;
+  causedByEventId?: string;
+  capabilities?: Partial<SpanCapabilities>;
+  attributes?: Record<string, unknown>;
+}): OmniMessage<SpanBeginPayload> {
+  return withTraceContext(
+    event({
+      type: "span_begin",
+      span_kind: args.kind,
+      capabilities: capabilitiesFor(args.kind, args.capabilities),
+      ...(args.attributes !== undefined ? { attributes: args.attributes } : {}),
+    }),
+    {
+      trace_id: args.traceId,
+      ...(args.taskId !== undefined ? { task_id: args.taskId } : {}),
+      ...(args.stepId !== undefined ? { step_id: args.stepId } : {}),
+      span_id: args.spanId,
+      ...(args.parentSpanId !== undefined ? { parent_span_id: args.parentSpanId } : {}),
+      ...(args.causedByEventId !== undefined ? { caused_by_event_id: args.causedByEventId } : {}),
+    },
+  );
+}
+
+/** Closes an execution Span without modifying its begin record. */
+export function spanEnd(args: {
+  kind: SpanKind;
+  traceId: string;
+  taskId?: string;
+  stepId?: string;
+  spanId: string;
+  parentSpanId?: string;
+  causedByEventId?: string;
+  status: SpanStatus;
+  errorMessage?: string;
+}): OmniMessage<SpanEndPayload> {
+  return withTraceContext(
+    event({
+      type: "span_end",
+      span_kind: args.kind,
+      status: args.status,
+      ...(args.errorMessage !== undefined ? { error_message: args.errorMessage } : {}),
+    }),
+    {
+      trace_id: args.traceId,
+      ...(args.taskId !== undefined ? { task_id: args.taskId } : {}),
+      ...(args.stepId !== undefined ? { step_id: args.stepId } : {}),
+      span_id: args.spanId,
+      ...(args.parentSpanId !== undefined ? { parent_span_id: args.parentSpanId } : {}),
+      ...(args.causedByEventId !== undefined ? { caused_by_event_id: args.causedByEventId } : {}),
+    },
+  );
+}
+
+/** Emits an explicit semantic observation; callers bind it to its owning Span with Trace context. */
+export function observation(args: {
+  kind: ObservationKind;
+  content?: string;
+  data?: Record<string, unknown>;
+}): OmniMessage<ObservationPayload> {
+  return event({
+    type: "observation",
+    kind: args.kind,
+    ...(args.content !== undefined ? { content: args.content } : {}),
+    ...(args.data !== undefined ? { data: args.data } : {}),
+  });
+}
+
 export function approvalDecision(
   decision: ApprovalDecision,
   toolCallId: string,
@@ -341,8 +499,16 @@ export function goalFinished(
 }
 
 /** subagent derivation pointer event: records only the direct child session's Session id (written to the parent Trace by context_engine). */
-export function subagentEvent(sessionId: string): OmniMessage<SubagentPayload> {
-  return event({ type: "subagent", session_id: sessionId });
+export function subagentEvent(
+  sessionId: string,
+  child?: { traceId?: string; taskId?: string },
+): OmniMessage<SubagentPayload> {
+  return event({
+    type: "subagent",
+    session_id: sessionId,
+    ...(child?.traceId !== undefined ? { trace_id: child.traceId } : {}),
+    ...(child?.taskId !== undefined ? { task_id: child.taskId } : {}),
+  });
 }
 
 export function emptyTokenCounts(): TokenCounts {
@@ -392,4 +558,12 @@ export function addTokenCounts(a: TokenCounts, b: TokenCounts): TokenCounts {
  */
 export function withOrigin<M extends OmniMessage>(msg: M, sessionId: MessageOrigin): M {
   return { ...msg, origin: [sessionId, ...(msg.origin ?? [])] };
+}
+
+/** Assigns a message to a logical Trace/Task/Step Span while preserving its stable Event identity. */
+export function withTraceContext<M extends OmniMessage>(msg: M, trace: TraceContext): M {
+  return {
+    ...withProtocolIdentity(msg),
+    trace: msg.trace ? { ...msg.trace, ...trace } : trace,
+  };
 }

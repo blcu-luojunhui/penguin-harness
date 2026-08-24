@@ -334,35 +334,39 @@ describe("Session first-run bootstrap events", () => {
       const streamed: OmniMessage[] = [];
       for await (const msg of session.run([userText("go")])) streamed.push(msg);
       const types = streamed.map((m) => (m.payload as { type?: string }).type);
-      expect(types.slice(0, 3)).toEqual([
-        "mcp_connect_begin",
-        "mcp_connect_end",
-        "tool_list_ready",
-      ]);
+      expect(
+        types.filter((type) =>
+          ["mcp_connect_begin", "mcp_connect_end", "tool_list_ready"].includes(type ?? ""),
+        ),
+      ).toEqual(["mcp_connect_begin", "mcp_connect_end", "tool_list_ready"]);
       expect(types).toContain("text");
-      const begin = streamed[0]!.payload as { servers?: string[] };
+      const begin = streamed.find(
+        (message) => (message.payload as { type?: string }).type === "mcp_connect_begin",
+      )!.payload as { servers?: string[] };
       expect(begin.servers).toEqual(["fx"]);
-      const end = streamed[1]!.payload as {
+      const end = streamed.find(
+        (message) => (message.payload as { type?: string }).type === "mcp_connect_end",
+      )!.payload as {
         status?: string;
         results?: { server: string; status: string; tools?: number; duration_ms: number }[];
       };
       expect(end.status).toBe("completed");
       expect(end.results).toHaveLength(1);
       expect(end.results![0]).toMatchObject({ server: "fx", status: "completed", tools: 6 });
-      const toolsMsg = streamed[2]!.payload as { tools?: { name: string }[] };
+      const toolsMsg = streamed.find(
+        (message) => (message.payload as { type?: string }).type === "tool_list_ready",
+      )!.payload as { tools?: { name: string }[] };
       expect(toolsMsg.tools!.map((t) => t.name)).toContain("mcp__fx__echo");
       // Trace ordering: the engine writes the bootstrap records AFTER the run's input, so
       // the connect phase belongs to the new turn — meta, the user text, then the pair.
       const writtenTypes = written.map(
         (m) => (m.payload as { type?: string }).type ?? "session_meta",
       );
-      expect(writtenTypes.slice(0, 5)).toEqual([
-        "session_meta",
-        "text",
-        "mcp_connect_begin",
-        "mcp_connect_end",
-        "tool_list_ready",
-      ]);
+      expect(writtenTypes[0]).toBe("session_meta");
+      expect(writtenTypes.indexOf("text")).toBeLessThan(writtenTypes.indexOf("mcp_connect_begin"));
+      expect(writtenTypes.indexOf("mcp_connect_begin")).toBeLessThan(
+        writtenTypes.indexOf("mcp_connect_end"),
+      );
       // Second run: the bootstrap already happened — no repeated events.
       const second: OmniMessage[] = [];
       for await (const msg of session.run([userText("again")])) second.push(msg);
@@ -385,11 +389,82 @@ describe("Session first-run bootstrap events", () => {
       const streamed: OmniMessage[] = [];
       for await (const msg of session.run([userText("go")])) streamed.push(msg);
       const types = streamed.map((m) => (m.payload as { type?: string }).type);
-      expect(types[0]).toBe("tool_list_ready");
+      expect(types).toContain("tool_list_ready");
       expect(types).not.toContain("mcp_connect_begin");
     } finally {
       session.dispose();
     }
+  });
+
+  it("serializes Session operations while a deferred bootstrap owns the Trace scope", async () => {
+    let bootstrapCalls = 0;
+    let releaseBootstrap!: () => void;
+    const bootstrapGate = new Promise<void>((resolve) => {
+      releaseBootstrap = resolve;
+    });
+    const env = new Environment({
+      workspaceDir: tmp,
+      toolConfig: { customTools: [], mcpServers: [] },
+    });
+    const written: OmniMessage[] = [];
+    const session = new Session({
+      meta: {
+        session_id: "s-operation-lock",
+        provider: "custom",
+        model_id: "m",
+        model_context_window: 1000,
+        system_prompt: "sp",
+        agent_state: tmp,
+        workspace: tmp,
+      },
+      bootstrap: async () => {
+        bootstrapCalls += 1;
+        await bootstrapGate;
+        return {
+          tools: [],
+          llm: {
+            async *streamGenerate(): AsyncGenerator<OmniMessage, LLMOutcome> {
+              yield assistantText("done");
+              return { status: "completed" };
+            },
+          },
+          mcp: [],
+        };
+      },
+      mcpServers: [],
+      environment: env,
+      trace: { write: async (message) => void written.push(message) },
+      imagesDir: path.join(tmp, "scratch-lock"),
+      modelHasVision: true,
+    });
+
+    const first = session.run([userText("first")]);
+    await first.next(); // trace_begin
+    await first.next(); // agent.task begin
+    const waitingOnBootstrap = first.next();
+    for (let index = 0; index < 100 && bootstrapCalls === 0; index += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    expect(bootstrapCalls).toBe(1);
+    const activeTraceId = written.find(
+      (message) => (message.payload as { type?: string }).type === "trace_begin",
+    )?.trace?.trace_id;
+    const writesBeforeConflict = written.length;
+
+    await expect(session.run([userText("second")]).next()).rejects.toThrow(/Session is busy/);
+    await expect(session.compact().next()).rejects.toThrow(/Session is busy/);
+    expect(written).toHaveLength(writesBeforeConflict);
+    expect(bootstrapCalls).toBe(1);
+    expect(new Set(written.map((message) => message.trace?.trace_id).filter(Boolean))).toEqual(
+      new Set([activeTraceId]),
+    );
+
+    releaseBootstrap();
+    await waitingOnBootstrap;
+    for await (const _ of first) {
+      // drain
+    }
+    session.dispose();
   });
 
   it("aborts mid-connect: cancels the attempt (live-only events) and the next run reconnects", async () => {
@@ -452,33 +527,53 @@ describe("Session first-run bootstrap events", () => {
       ac.abort();
       await run;
       const firstTypes = first.map((m) => (m.payload as { type?: string }).type);
-      expect(firstTypes).toEqual(["mcp_connect_begin", "mcp_connect_end", "abort"]);
-      expect((first[1]!.payload as { status?: string }).status).toBe("aborted");
+      expect(
+        firstTypes.filter((type) =>
+          ["mcp_connect_begin", "mcp_connect_end", "abort"].includes(type ?? ""),
+        ),
+      ).toEqual(["mcp_connect_begin", "mcp_connect_end", "abort"]);
+      expect(
+        first.find((message) => (message.payload as { type?: string }).type === "mcp_connect_end")!
+          .payload,
+      ).toMatchObject({ status: "aborted" });
       // The aborted turn is RECORDED: the Session itself writes the input, the aborted
       // connect pair and the abort event (no engine exists to do it) — the analysis page
       // shows the interruption and a reload/restart keeps the message.
       const writtenTypes = written.map(
         (m) => (m.payload as { type?: string }).type ?? "session_meta",
       );
-      expect(writtenTypes).toEqual([
-        "session_meta",
-        "text",
-        "mcp_connect_begin",
-        "mcp_connect_end",
-        "abort",
-      ]);
-      expect((written.at(-2)!.payload as { status?: string }).status).toBe("aborted");
+      expect(
+        writtenTypes.filter((type) =>
+          ["session_meta", "text", "mcp_connect_begin", "mcp_connect_end", "abort"].includes(type),
+        ),
+      ).toEqual(["session_meta", "text", "mcp_connect_begin", "mcp_connect_end", "abort"]);
+      expect(
+        written.find(
+          (message) => (message.payload as { type?: string }).type === "mcp_connect_end",
+        )!.payload,
+      ).toMatchObject({ status: "aborted" });
+      const spanKinds = written
+        .filter((message) => (message.payload as { type?: string }).type === "span_begin")
+        .map((message) => (message.payload as { span_kind?: string }).span_kind);
+      expect(spanKinds).toEqual(["agent.task"]);
+      expect(
+        written.find((message) => (message.payload as { type?: string }).type === "trace_end")
+          ?.payload,
+      ).toMatchObject({ root_kind: "task", status: "aborted" });
 
       release();
       const second: OmniMessage[] = [];
       for await (const msg of session.run([userText("again")])) second.push(msg);
       const secondTypes = second.map((m) => (m.payload as { type?: string }).type);
-      expect(secondTypes.slice(0, 3)).toEqual([
-        "mcp_connect_begin",
-        "mcp_connect_end",
-        "tool_list_ready",
-      ]);
-      expect((second[1]!.payload as { status?: string }).status).toBe("completed");
+      expect(
+        secondTypes.filter((type) =>
+          ["mcp_connect_begin", "mcp_connect_end", "tool_list_ready"].includes(type ?? ""),
+        ),
+      ).toEqual(["mcp_connect_begin", "mcp_connect_end", "tool_list_ready"]);
+      expect(
+        second.find((message) => (message.payload as { type?: string }).type === "mcp_connect_end")!
+          .payload,
+      ).toMatchObject({ status: "completed" });
       expect(secondTypes).toContain("text");
       // Abort cancels the attempt: the next run started a FRESH bootstrap (reconnect).
       expect(calls).toBe(2);
@@ -494,6 +589,24 @@ describe("Session first-run bootstrap events", () => {
         .map((m) => (m.payload as { text?: string }).text)
         .filter((t): t is string => t === "go" || t === "again");
       expect(requestTexts).toEqual(["go", "again"]);
+      const taskBegins = written.filter(
+        (message) =>
+          (message.payload as { type?: string; span_kind?: string }).type === "span_begin" &&
+          (message.payload as { span_kind?: string }).span_kind === "agent.task",
+      );
+      const secondTaskAttributes = (
+        taskBegins[1]!.payload as { attributes?: Record<string, unknown> }
+      ).attributes!;
+      const again = written.find(
+        (message) =>
+          message.type === "model_msg" && (message.payload as { text?: string }).text === "again",
+      )!;
+      expect(secondTaskAttributes.input_event_ids).toEqual([again.event_id]);
+      expect(
+        (secondTaskAttributes.input_snapshot as OmniMessage[]).map(
+          (message) => (message.payload as { text?: string }).text,
+        ),
+      ).toEqual(["go"]);
     } finally {
       session.dispose();
     }

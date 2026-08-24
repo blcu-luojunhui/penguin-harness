@@ -879,11 +879,10 @@ export interface SessionInfo {
   /** Whether archived (hidden from the default list, grouped under "Archived"). */
   archived: boolean;
   /**
-   * Absolute path of the session's latest Trace file (the current context shard); absent
-   * when no Trace exists yet. Populated on the **single-session GET only** — list rows omit
-   * it (locating it costs a directory walk per Session). The web's `/model` switch puts it
-   * into the new session's `[model_switch_from]` block so the model can read the source
-   * history itself when it needs it.
+   * Absolute path of the protocol-v3 Session Trace bundle directory; absent when no v3
+   * Session journal exists yet. Populated on the **single-session GET only** — list rows
+   * omit it. The web's `/model` switch puts it into the new session's
+   * `[model_switch_from]` block so the model can read the source history itself.
    */
   tracePath?: string;
 }
@@ -1000,10 +999,11 @@ export interface MessagesLiveTail {
  */
 export interface MessagesPageInfo {
   /**
-   * Cursor of this window's first unit (`<shardIndex>:<ordinal>`): pass it back as
-   * `before=` to fetch the previous window. Stable across requests and compaction —
-   * rotation opens a NEW shard and closed shards are immutable. Absent = this window
-   * reaches the very beginning of the transcript (no older history).
+   * Cursor of this window's first unit (`<sourceIndex>:<ordinal>`): sourceIndex is a
+   * legacy shard index or a protocol-v3 physical Session-journal line ordinal. Pass it
+   * back as `before=` to fetch the previous window. Append-only growth keeps it stable;
+   * malformed journal lines retain their ordinal. Absent = this window reaches the
+   * beginning of the transcript.
    */
   before?: string;
   /**
@@ -1026,9 +1026,38 @@ export interface MessagesPageInfo {
   };
 }
 
+export type TraceHistoryDiagnosticCode =
+  | "dangling_trace_event_link"
+  | "trace_event_mismatch"
+  | "duplicate_trace_event_link"
+  | "unlinked_trace_event"
+  | "malformed_session_journal"
+  | "missing_trace_event_file";
+
+/** A protocol-v3 history integrity issue discovered without guessing record order. */
+export interface TraceHistoryDiagnostic {
+  code: TraceHistoryDiagnosticCode;
+  /** Session bundle that owns the damaged journal or event payload. */
+  sessionId: string;
+  /** Zero-based Session-journal record index, when the issue came from a journal link. */
+  journalIndex?: number;
+  traceId?: string;
+  eventId?: string;
+  message: string;
+}
+
+/** Integrity state of the explicit protocol-v3 history projection. */
+export interface TraceHistoryInfo {
+  protocolVersion: 3;
+  partial: boolean;
+  diagnostics: TraceHistoryDiagnostic[];
+}
+
 /** Message history: the full messages and events from concatenating all of this Session's Trace files in order (excludes partial_*). */
 export interface MessagesResponse {
   messages: OmniMessage[];
+  /** Present when any part of this expanded transcript came from protocol-v3 storage. */
+  history?: TraceHistoryInfo;
   /**
    * Present only while the Session is running/compacting: the in-progress stream tail
    * (open streaming fragments + the channel cursor they cover), so a client joining
@@ -1326,6 +1355,114 @@ export interface TraceEventsResponse {
   limit: number;
   /** Total line count of the file (basis for pagination). */
   total: number;
+}
+
+/** One explicitly recorded ReAct Turn, rooted at an `agent.turn` Span. */
+export interface TraceTurnSummary {
+  turnId: string;
+  rootSpanId: string;
+  startTs: string;
+  endTs?: string;
+  status?: string;
+  /** Number of protocol-v2 records in the shard carrying this Turn id. */
+  recordCount: number;
+}
+
+/** Explicit Turn inventory for one Trace shard. V1 shards are reported without inference. */
+export interface TraceTurnsResponse {
+  supported: boolean;
+  protocolVersion: 2 | null;
+  turns: TraceTurnSummary[];
+}
+
+/** Resolved navigation target of an explicit subagent pointer in a Turn. */
+export interface TraceTurnSubagent {
+  sessionId: string;
+  agentId: string;
+}
+
+/** All explicit protocol-v2 records belonging to one Turn in a Trace shard. */
+export interface TraceTurnResponse {
+  protocolVersion: 2;
+  turn: TraceTurnSummary;
+  records: OmniMessage[];
+  /** Unique, resolvable child Sessions referenced by explicit subagent events in `records`. */
+  subagents: TraceTurnSubagent[];
+}
+
+/** Protocol-v3 logical Trace root kinds. */
+export type TraceRootKind = "goal_run" | "task";
+
+/** One explicitly recorded Agent Step within a logical Trace Task. */
+export interface TraceStepSummary {
+  stepId: string;
+  /** The `agent.step` Span id; absent when the lifecycle begin/end is incomplete. */
+  spanId?: string;
+  taskId: string;
+  startTs?: string;
+  endTs?: string;
+  status?: string;
+  recordCount: number;
+  partial: boolean;
+}
+
+/** One explicitly recorded Task and its Agent Steps. */
+export interface TraceTaskSummary {
+  taskId: string;
+  /** The `agent.task` Span id; absent when the lifecycle begin/end is incomplete. */
+  spanId?: string;
+  startTs?: string;
+  endTs?: string;
+  status?: string;
+  recordCount: number;
+  partial: boolean;
+  steps: TraceStepSummary[];
+}
+
+/** One protocol-v3 logical Trace rooted at a Goal Run or standalone Task. */
+export interface TraceRootSummary {
+  traceId: string;
+  /** Null only for a partial Trace whose root lifecycle record is missing. */
+  rootKind: TraceRootKind | null;
+  startTs?: string;
+  endTs?: string;
+  status?: string;
+  recordCount: number;
+  taskCount: number;
+  partial: boolean;
+}
+
+/** Session-scoped logical Trace inventory. V1/v2 storage is reported without inference. */
+export interface TraceRootsResponse {
+  supported: boolean;
+  protocolVersion: 3 | null;
+  roots: TraceRootSummary[];
+  /** Storage-integrity issues that made one or more root summaries partial. */
+  diagnostics?: TraceHistoryDiagnostic[];
+}
+
+/** Navigation edge from a parent `subagent.invoke` Span to a child Session or exact Trace. */
+export interface TraceRootSubagent {
+  sessionId: string;
+  /** Resolved owner in the current Project; absent when the child Trace is unavailable. */
+  agentId?: string;
+  /** Exact protocol-v3 child root when the pointer recorded it. */
+  childTraceId?: string;
+  childTaskId?: string;
+  invocationSpanId?: string;
+  eventId?: string;
+}
+
+/** All explicit protocol-v3 records belonging to one logical Trace. */
+export interface TraceRootResponse {
+  protocolVersion: 3;
+  root: TraceRootSummary;
+  tasks: TraceTaskSummary[];
+  /** Matching v3 records in first-winning Session-journal link order. */
+  records: OmniMessage[];
+  subagents: TraceRootSubagent[];
+  /** Storage-integrity issues attributed to this root. */
+  diagnostics?: TraceHistoryDiagnostic[];
 }
 
 /** Duration span of a single LLM Request (request_begin/request_end paired by proximity). */

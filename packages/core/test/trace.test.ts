@@ -6,16 +6,29 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   assistantText,
+  compactionBegin,
+  compactionEnd,
   imageUrlMessage,
   partialText,
+  requestBegin,
+  requestEnd,
   sessionMeta,
+  spanBegin,
   subagentEvent,
   tokenUsage,
   emptyTokenCounts,
   withOrigin,
+  traceBegin,
+  withTraceContext,
 } from "../src/omnimessage/index.js";
 import type { OmniMessage } from "../src/omnimessage/index.js";
-import { Writer, parseTraceLines, readTrace } from "../src/trace/index.js";
+import {
+  loadV3Session,
+  TraceStore,
+  Writer,
+  parseTraceLines,
+  readTrace,
+} from "../src/trace/index.js";
 
 const SESSION_ID = "sess_abc";
 
@@ -421,5 +434,276 @@ describe("Writer", () => {
       await writer.write(fresh);
       expect(await readFile(writer.currentPath(), "utf8")).toBe(`${JSON.stringify(fresh)}\n`);
     });
+  });
+});
+
+describe("TraceStore protocol v3", () => {
+  let tracesDir: string;
+
+  beforeEach(async () => {
+    tracesDir = await mkdtemp(join(tmpdir(), "penguin-trace-v3-"));
+  });
+
+  afterEach(async () => {
+    await rm(tracesDir, { recursive: true, force: true });
+  });
+
+  it("heals a crash-torn Session journal before appending its first fact", async () => {
+    const store = new TraceStore({ tracesDir, sessionId: SESSION_ID });
+    await mkdir(join(tracesDir, SESSION_ID), { recursive: true });
+    const torn = `{"record_type":"session_fact"`;
+    await writeFile(store.sessionPath(), torn, "utf8");
+
+    await store.write(meta());
+
+    const raw = await readFile(store.sessionPath(), "utf8");
+    expect(raw.startsWith(`${torn}\n`)).toBe(true);
+    const last = JSON.parse(raw.trim().split("\n").at(-1)!) as { record_type: string };
+    expect(last.record_type).toBe("session_fact");
+  });
+
+  it("heals a crash-torn logical Trace before appending the next event", async () => {
+    const traceId = "trace-crash";
+    const taskId = "task-crash";
+    const first = new TraceStore({ tracesDir, sessionId: SESSION_ID });
+    await first.write(meta());
+    const begin = traceBegin({ rootKind: "task", traceId, taskId });
+    await first.write(begin);
+    const torn = `{"timestamp":"torn","type":"event_msg"`;
+    await writeFile(first.tracePath(traceId), torn, { encoding: "utf8", flag: "a" });
+
+    const resumed = new TraceStore({ tracesDir, sessionId: SESSION_ID });
+    const task = spanBegin({ kind: "agent.task", traceId, taskId, spanId: taskId });
+    await resumed.write(task);
+
+    const raw = await readFile(resumed.tracePath(traceId), "utf8");
+    expect(raw).toContain(`${torn}\n${JSON.stringify(task)}\n`);
+    expect(parseTraceLines(raw)).toEqual([begin, task]);
+  });
+
+  it("invalidates its tail cache after a same-process short write", async () => {
+    const traceId = "trace-short-write";
+    const taskId = "task-short-write";
+    const store = new TraceStore({ tracesDir, sessionId: SESSION_ID });
+    await store.write(meta());
+    const begin = traceBegin({ rootKind: "task", traceId, taskId });
+    await store.write(begin);
+
+    const torn = withTraceContext(assistantText("torn"), {
+      trace_id: traceId,
+      task_id: taskId,
+    });
+    const proto = await fileHandleProto(tracesDir);
+    const originalWrite = proto.write;
+    const writeSpy = vi.spyOn(proto, "write");
+    try {
+      writeSpy.mockImplementationOnce(function (this: unknown, ...args: unknown[]) {
+        const [buffer] = args as [Buffer];
+        const half = buffer.subarray(0, Math.floor(buffer.length / 2));
+        return originalWrite.call(this, half);
+      });
+      await expect(store.write(torn)).rejects.toThrow(/wrote .* of .* bytes/);
+    } finally {
+      writeSpy.mockRestore();
+    }
+
+    const after = withTraceContext(assistantText("after short write"), {
+      trace_id: traceId,
+      task_id: taskId,
+    });
+    await store.write(after);
+    expect(parseTraceLines(await readFile(store.tracePath(traceId), "utf8"))).toEqual([
+      begin,
+      after,
+    ]);
+  });
+
+  it("fails closed for an event whose Trace has no journal link", async () => {
+    const store = new TraceStore({ tracesDir, sessionId: SESSION_ID });
+    await store.write(meta());
+    await expect(
+      store.write(
+        withTraceContext(assistantText("orphan"), {
+          trace_id: "missing-root",
+          task_id: "missing-task",
+        }),
+      ),
+    ).rejects.toThrow(/no trace_begin link/);
+  });
+
+  it("reports a linked Trace whose events file is missing as a partial WAL hole", async () => {
+    const traceId = "trace-missing-file";
+    const store = new TraceStore({ tracesDir, sessionId: SESSION_ID });
+    await store.write(meta());
+    await store.write(traceBegin({ rootKind: "task", traceId, taskId: "task-missing" }));
+    await rm(store.tracePath(traceId));
+
+    const loaded = await loadV3Session(tracesDir, SESSION_ID);
+    expect(loaded?.partial).toBe(true);
+    expect(loaded?.events).toEqual([]);
+    expect(loaded?.diagnostics.map((diagnostic) => diagnostic.code)).toEqual(
+      expect.arrayContaining(["missing_trace_event_file", "dangling_trace_event_link"]),
+    );
+  });
+
+  it("writes a controlled atomic checkpoint link after successful compaction", async () => {
+    const traceId = "trace-checkpoint";
+    const taskId = "task-checkpoint";
+    const store = new TraceStore({ tracesDir, sessionId: SESSION_ID });
+    await store.write(meta());
+    await store.write(traceBegin({ rootKind: "task", traceId, taskId }));
+    await store.write(
+      withTraceContext(
+        compactionBegin({ reason: "manual", mode: "discard", context: 1, turns: 1 }),
+        { trace_id: traceId, task_id: taskId },
+      ),
+    );
+    await store.write(
+      withTraceContext(compactionEnd({ reason: "manual", mode: "discard", status: "completed" }), {
+        trace_id: traceId,
+        task_id: taskId,
+      }),
+    );
+
+    const records = (await readFile(store.sessionPath(), "utf8"))
+      .trim()
+      .split("\n")
+      .flatMap((line) => {
+        try {
+          return [JSON.parse(line) as { record_type?: string; checkpoint_file?: string }];
+        } catch {
+          return [];
+        }
+      });
+    const link = records.find((record) => record.record_type === "context_checkpoint_link")!;
+    expect(link.checkpoint_file).toMatch(/^[0-9a-f-]+\.json$/);
+    expect(link.checkpoint_file).not.toContain("/");
+    expect(
+      await stat(join(tracesDir, SESSION_ID, "checkpoints", link.checkpoint_file!)),
+    ).toBeDefined();
+  });
+
+  it("writes one format marker and journals every Trace event before its payload", async () => {
+    const store = new TraceStore({ tracesDir, sessionId: SESSION_ID });
+    await store.write(meta());
+    const begin = traceBegin({ rootKind: "task", traceId: "trace-order", taskId: "task-order" });
+    const text = withTraceContext(assistantText("ordered"), {
+      trace_id: "trace-order",
+      task_id: "task-order",
+    });
+    await store.write(begin);
+    await store.write(text);
+
+    const journal = (await readFile(store.sessionPath(), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { record_type: string; event_id?: string });
+    expect(journal[0]).toMatchObject({
+      record_type: "session_format",
+      protocol_version: 3,
+      format: "penguin.trace.session",
+      format_version: 1,
+      session_id: SESSION_ID,
+    });
+    expect(journal.filter((record) => record.record_type === "session_format")).toHaveLength(1);
+    expect(
+      journal
+        .filter((record) => record.record_type === "trace_event_link")
+        .map((record) => record.event_id),
+    ).toEqual([begin.event_id, text.event_id]);
+    expect(
+      (await readTrace(store.tracePath("trace-order"))).map((event) => event.event_id),
+    ).toEqual([begin.event_id, text.event_id]);
+  });
+
+  it("marks a malformed middle journal record as an ordering hole", async () => {
+    const store = new TraceStore({ tracesDir, sessionId: SESSION_ID });
+    await store.write(meta());
+    await store.write(traceBegin({ rootKind: "task", traceId: "trace-gap", taskId: "task-gap" }));
+    await store.write(
+      withTraceContext(assistantText("after gap"), {
+        trace_id: "trace-gap",
+        task_id: "task-gap",
+      }),
+    );
+    const lines = (await readFile(store.sessionPath(), "utf8")).trim().split("\n");
+    lines.splice(lines.length - 1, 0, "{torn-journal-record");
+    await writeFile(store.sessionPath(), `${lines.join("\n")}\n`, "utf8");
+
+    const loaded = await loadV3Session(tracesDir, SESSION_ID);
+    expect(loaded?.partial).toBe(true);
+    expect(loaded?.diagnostics).toContainEqual(
+      expect.objectContaining({ code: "malformed_session_journal" }),
+    );
+  });
+
+  it("keeps a durable compaction event usable when checkpoint creation fails", async () => {
+    const store = new TraceStore({ tracesDir, sessionId: SESSION_ID });
+    await store.write(meta());
+    await store.write(
+      traceBegin({ rootKind: "task", traceId: "trace-checkpoint-fail", taskId: "task-fail" }),
+    );
+    vi.spyOn(
+      store as unknown as { createCheckpoint: () => Promise<void> },
+      "createCheckpoint",
+    ).mockRejectedValueOnce(new Error("disk full"));
+    await expect(
+      store.write(
+        withTraceContext(
+          compactionEnd({ reason: "manual", mode: "discard", status: "completed" }),
+          { trace_id: "trace-checkpoint-fail", task_id: "task-fail" },
+        ),
+      ),
+    ).resolves.toBeUndefined();
+
+    const loaded = await loadV3Session(tracesDir, SESSION_ID);
+    expect(loaded?.resumed.contextClosed).toBe(true);
+    expect(
+      loaded?.journal.filter((record) => record.record_type === "context_checkpoint_link"),
+    ).toHaveLength(0);
+  });
+
+  it("falls back to an older checkpoint and applies a later compaction in its tail", async () => {
+    const store = new TraceStore({ tracesDir, sessionId: SESSION_ID });
+    await store.write(meta());
+    await store.write(traceBegin({ rootKind: "task", traceId: "trace-one", taskId: "task-one" }));
+    await store.write(
+      withTraceContext(compactionEnd({ reason: "manual", mode: "discard", status: "completed" }), {
+        trace_id: "trace-one",
+        task_id: "task-one",
+      }),
+    );
+    await store.write(traceBegin({ rootKind: "task", traceId: "trace-two", taskId: "task-two" }));
+    const scope = { trace_id: "trace-two", task_id: "task-two", step_id: "step-two" };
+    for (const message of [
+      compactionBegin({ reason: "manual", mode: "summarize", context: 2, turns: 1 }),
+      userText("COMPACT"),
+      requestBegin(),
+      assistantText("[summary]second reset[/summary]"),
+      requestEnd("completed"),
+      compactionEnd({ reason: "manual", mode: "summarize", status: "completed" }),
+    ]) {
+      await store.write(withTraceContext(message, scope));
+    }
+    const journal = (await readFile(store.sessionPath(), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { record_type: string; checkpoint_file?: string });
+    const checkpoints = journal.filter(
+      (record) => record.record_type === "context_checkpoint_link",
+    );
+    expect(checkpoints).toHaveLength(2);
+    await writeFile(
+      join(tracesDir, SESSION_ID, "checkpoints", checkpoints[1]!.checkpoint_file!),
+      "{broken",
+      "utf8",
+    );
+
+    const loaded = await loadV3Session(tracesDir, SESSION_ID);
+    expect(loaded?.resumed.contextClosed).toBe(true);
+    expect((loaded?.resumed.pendingSummary?.payload as { text?: string }).text).toContain(
+      "second reset",
+    );
+    expect(loaded?.resumed.history).toEqual([]);
   });
 });

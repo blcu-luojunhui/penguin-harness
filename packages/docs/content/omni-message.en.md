@@ -14,17 +14,35 @@ Every message shares one envelope; only the `payload` varies:
 ```ts
 interface OmniMessage<P extends OmniPayload = OmniPayload> {
   timestamp: string;        // ISO 8601 UTC
+  protocol_version?: number;// new builders always write 3; absent on legacy records
+  event_id?: string;        // stable UUID, unchanged between live stream and Trace
   type: "session_meta" | "model_msg" | "event_msg";
   payload: P;
+  trace?: TraceContext;     // logical Trace / Task / Step ownership and causality
   origin?: string[];        // child-Session chain (outer→inner); absent = main Session
 }
+
+interface TraceContext {
+  trace_id: string;         // Goal Run or standalone Task root
+  task_id?: string;         // Task inside that root
+  step_id?: string;         // one Agent Step inside that Task
+  span_id?: string;         // the Span that owns this Event
+  parent_span_id?: string;  // execution hierarchy for lifecycle Events
+  caused_by_event_id?: string; // causal Event, e.g. tool proposal → tool execution
+}
 ```
+
+Every message produced by the built-in builders has `protocol_version: 3` and an opaque
+`event_id`. The fields stay optional in the TypeScript interface only so an existing Trace or an
+SDK-supplied legacy-shaped input can still be read. The producer assigns identity before the
+message is streamed or persisted; the Trace writer never replaces it. Stored protocol-v3
+execution records carry `trace`; unscoped Session facts such as `session_meta` do not.
 
 What each message type carries:
 
 | type | Meaning | Volume |
 | --- | --- | --- |
-| `session_meta` | The full runtime configuration of one model context | exactly one per context |
+| `session_meta` | The immutable runtime configuration of one Session | exactly one per Session |
 | `model_msg` | Content inside the model context (text, thinking, tool calls and results) | the bulk |
 | `event_msg` | Runtime events outside the context (approvals, usage, compaction, aborts) | alongside |
 
@@ -43,7 +61,7 @@ interface SessionMetaPayload {
 }
 ```
 
-session_meta holds **per-session invariants only** — the model, system prompt and Workspace are immutable for the Session's lifetime; on resume, the engine takes this Trace line as the runtime config. See [Sessions & Traces](/sessions-and-traces). The thinking level is a per-turn parameter (sent with each Task) and is not recorded here; a `thinking_level` field still present in a legacy Trace's meta is ignored on resume — the resumed Session reads the Agent's current config instead.
+session_meta holds **per-session invariants only** — the model, system prompt and Workspace are immutable for the Session's lifetime; on resume, the engine takes the first such Session journal fact as the runtime config. See [Sessions & Traces](/sessions-and-traces). The thinking level is a per-run parameter (sent with each Task) and is not recorded here; a `thinking_level` field still present in a legacy Trace's meta is ignored on resume — the resumed Session reads the Agent's current config instead.
 
 The tool schema is **not in the meta**: the toolset is only known after MCP Servers connect, and the meta must not wait for that — the full tool definitions arrive as a standalone `tool_list_ready` event at the first run (see event_msg). Pre-split Traces embedded a `tools` field here; that field is explicitly no longer read (their tool record is not displayed).
 
@@ -115,7 +133,7 @@ interface InlineDataPayload {
 }
 ```
 
-`tool_call` and `tool_call_output` pair strictly via `tool_call_id`; a turn's calls form one batch, and outputs are re-fed in the original call order (see [The Agent Loop](/agent-loop)).
+`tool_call` and `tool_call_output` pair strictly via `tool_call_id`; an Agent Step's calls form one batch, and outputs are re-fed in the original call order (see [The Agent Loop](/agent-loop)).
 
 ## model_msg: streaming partials
 
@@ -175,16 +193,76 @@ Renderers can therefore paint deltas incrementally and swap in the complete mess
 
 ## event_msg
 
-Eleven event payloads, all listed field by field:
+Lifecycle Events materialize execution Spans from append-only records. Semantic observations are
+explicit Events; renderers must not infer planning, verification, or evaluation from free text.
+The existing control and statistics Events follow them below.
 
 ```ts
+type SpanKind =
+  | "agent.task"
+  | "agent.step"
+  | "llm.request"
+  | "llm.attempt"
+  | "tool.execute"
+  | "subagent.invoke"
+  | "memory.write"
+  | "knowledge.write";
+
+type TraceRootKind = "goal_run" | "task";
+type TraceStatus = StopReason | "skipped" | "blocked" | "budget_limited";
+
+interface TraceBeginPayload {
+  type: "trace_begin";
+  root_kind: TraceRootKind;
+}
+
+interface TraceEndPayload {
+  type: "trace_end";
+  root_kind: TraceRootKind;
+  status: TraceStatus;
+  error_message?: string;
+}
+
+interface SpanBeginPayload {
+  type: "span_begin";
+  span_kind: SpanKind;
+  capabilities: {
+    editable_input: boolean;
+    repeatable: boolean;
+    rerunnable: boolean;
+    skippable: boolean;
+  };
+  attributes?: Record<string, unknown>; // input Event references, attempt/tool identity, …
+}
+
+interface SpanEndPayload {
+  type: "span_end";
+  span_kind: SpanKind;
+  status: StopReason | "skipped";
+  error_message?: string;
+}
+
+interface ObservationPayload {
+  type: "observation";
+  kind:
+    | "thinking"
+    | "planning"
+    | "verification"
+    | "evaluation"
+    | "output"
+    | "result"
+    | "progress"
+    | "memory"
+    | "knowledge";
+  content?: string;
+  data?: Record<string, unknown>;
+}
+
 interface ToolListReadyPayload {
   type: "tool_list_ready";
   tools: ToolDefinition[];    // the complete tool schema sent to the model; emitted once
-                              // at the first run (after MCP discovery), written to the
-                              // Trace right after the run's input (it belongs to the new
-                              // turn), and rewritten with session_meta at the head of
-                              // each post-compaction Trace file
+                              // after MCP discovery and persisted as a Session fact;
+                              // compaction does not rotate or rewrite logical Traces
 }
 
 interface ToolDefinition {
@@ -348,7 +426,7 @@ The payload is opaque to PenguinHarness: it passes through and persists verbatim
 | Surface | Subset used |
 | --- | --- |
 | SDK boundary (`session.run` output) | complete `model_msg` + streaming `partial_*` + all `event_msg` |
-| Trace on disk | `session_meta` + complete `model_msg` + all `event_msg` (no partials, no `origin`-tagged messages) |
+| Trace on disk | Session facts in `session.jsonl`; complete scoped `model_msg` and `event_msg` records in each logical Trace's `events.jsonl` (no partials or forwarded `origin` messages) |
 | Server SSE stream | same as the SDK boundary, verbatim single-line JSON — see [Server API](/server-api) |
 
 How messages travel along these surfaces — and every ordering guarantee — is covered on [Message Flow & Ordering](/message-flow).

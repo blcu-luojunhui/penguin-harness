@@ -8,7 +8,12 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { sessionMeta, userText } from "@prismshadow/penguin-core";
 import type { SessionMetaPayload } from "@prismshadow/penguin-core";
-import { makeTempRoot, makeTraceHarness, writeTraceFile } from "./helpers.js";
+import {
+  makeTempRoot,
+  makeTraceHarness,
+  writeLogicalTraceJournal,
+  writeTraceFile,
+} from "./helpers.js";
 
 const P = "project-i";
 const A = "agent-i";
@@ -46,6 +51,16 @@ function meta(sessionId: string, over: Partial<SessionMetaPayload> = {}): Sessio
     agent_state: "/tmp/a",
     workspace: "/ws/one",
     ...over,
+  };
+}
+
+function sessionFormat(sessionId: string) {
+  return {
+    record_type: "session_format",
+    protocol_version: 3,
+    format: "penguin.trace.session",
+    format_version: 1,
+    session_id: sessionId,
   };
 }
 
@@ -103,6 +118,85 @@ describe("trace-index", () => {
     expect(h.traceIndex.repo.listFilesByAgent(P, A)).toHaveLength(2);
     expect(h.traceIndex.counters.dirScans).toBe(scans + 1);
     expect(h.traceIndex.repo.getSession(S2)?.metaRead).toBe(true);
+  });
+
+  it("indexes v3 Session bundles without fake shard rows and deletes the complete bundle", async () => {
+    const journal = await writeLogicalTraceJournal(root, P, A, S1, [
+      sessionFormat(S1),
+      { record_type: "unknown", protocol_version: 3 },
+      {
+        record_type: "session_fact",
+        protocol_version: 3,
+        timestamp: "2026-07-05T10:00:00.000Z",
+        message: sessionMeta(meta(S1, { source: "subagent", workspace: "/ws/v3" })),
+      },
+      {
+        record_type: "trace_link",
+        protocol_version: 3,
+        timestamp: "2026-07-05T10:00:01.000Z",
+        session_id: S1,
+        trace_id: "trace-v3-aabb0001",
+        root_kind: "task",
+        task_id: "task-v3-aabb0001",
+      },
+    ]);
+    await fs.appendFile(journal, '{"record_type":"torn"', "utf8");
+
+    await h.traceIndex.reconcileAgent(P, A);
+    expect(h.traceIndex.repo.listFilesBySession(P, A, S1)).toEqual([]);
+    expect(h.traceIndex.repo.findAgentBySession(P, S1)).toBe(A);
+    expect(h.traceIndex.repo.getSession(S1)).toMatchObject({
+      source: "subagent",
+      workspace: "/ws/v3",
+      metaRead: true,
+    });
+
+    const listing = await h.service.agentTraces(
+      P,
+      A,
+      { offset: 0, limit: 10 },
+      { includeCli: true },
+    );
+    expect(listing.sessions).toEqual([
+      expect.objectContaining({ sessionId: S1, category: "subagent", files: [] }),
+    ]);
+
+    await h.service.deleteSessionTraces(P, A, S1);
+    await expect(fs.stat(path.dirname(journal))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(h.traceIndex.repo.getSession(S1)).toBeNull();
+    expect(h.traceIndex.repo.findAgentBySession(P, S1)).toBeNull();
+  });
+
+  it("requires a matching marker before a directory can replace legacy date indexing", async () => {
+    await writeTraceFile(root, P, A, "2026-07-05", S1, 1, [userText("legacy one")]);
+    await writeTraceFile(root, P, A, "2026-07-05", S1, 2, [userText("legacy two")]);
+    await h.traceIndex.reconcileAgent(P, A);
+    expect(h.traceIndex.repo.listFilesBySession(P, A, S1)).toHaveLength(2);
+
+    const dateDir = path.join(tracesRoot(root), "2026-07-05");
+    await fs.writeFile(
+      path.join(dateDir, "session.jsonl"),
+      `${JSON.stringify({ record_type: "export_metadata", protocol_version: 3 })}\n`,
+      "utf8",
+    );
+    await h.traceIndex.reconcileAgent(P, A, { force: true });
+    expect(h.traceIndex.repo.listFilesBySession(P, A, S1)).toHaveLength(2);
+
+    await writeLogicalTraceJournal(root, P, A, S2, [
+      {
+        record_type: "session_fact",
+        protocol_version: 3,
+        timestamp: "2026-07-06T09:00:00.000Z",
+        message: sessionMeta(meta(S2)),
+      },
+    ]);
+    await h.traceIndex.reconcileAgent(P, A, { force: true });
+    expect(h.traceIndex.repo.findAgentBySession(P, S2)).toBeNull();
+    expect(h.traceIndex.repo.listFilesBySession(P, A, S1)).toHaveLength(2);
+
+    await writeLogicalTraceJournal(root, P, A, S2, [sessionFormat(S1)]);
+    await h.traceIndex.reconcileAgent(P, A, { force: true });
+    expect(h.traceIndex.repo.findAgentBySession(P, S2)).toBeNull();
   });
 
   it("a new shard (compaction rotate) in a NON-newest date dir is caught by the gate", async () => {

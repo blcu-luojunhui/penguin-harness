@@ -167,12 +167,27 @@ Schedule 写操作仅限 Owner。新建 Session 模式的任务，`modelId` 与 
 | GET | /usage | 用量统计，查询参数 `from`、`to`、`groupBy`、`agentId`、`provider`、`modelId` |
 | GET | /usage/errors | 异常明细表分页（按时间倒序）：`offset`、`limit`，以及与看板一致的 `from` / `to` / `agentId` 过滤 → `{items, total}` |
 | GET | /agents/:agentId/traces | Trace 文件的日期 → Session 下钻结构 |
+| GET | /agents/:agentId/traces/:sessionId/roots | 跨整个 Session 读取协议 v3 的逻辑 Trace 根清单 |
+| GET | /agents/:agentId/traces/:sessionId/roots/:traceId | 读取一个 v3 Goal Run 或独立 Task 根，含 Task、Step、记录与子 Agent 链接 |
 | GET | /agents/:agentId/traces/:sessionId/:index | 读取 Trace 事件（`offset` / `limit` 分页） |
+| GET | /agents/:agentId/traces/:sessionId/:index/turns | 旧版：读取一个物理分片内协议 v2 的显式 ReAct Turn 清单 |
+| GET | /agents/:agentId/traces/:sessionId/:index/turns/:turnId | 旧版：读取一个 v2 Turn 的显式记录和子 Agent 导航目标 |
 | GET | /agents/:agentId/traces/:sessionId/:index/analysis | Trace 性能分析结果 |
 | GET | /agents/:agentId/traces/:sessionId/:index/download | 下载 Trace 原始文件（JSONL 附件） |
 | POST | /agents/:agentId/traces/import | 导入 Trace 文件：`{dataBase64}` → `{sessionId, index, date}` |
 
 Trace 下载对任意成员开放；导入仅限 owner（同 Agent 快照导入，上限 14MB）。导入文件必须是合法的 Trace JSONL，且首条记录为携带文件名安全 `session_id` 的 `session_meta`；若该 Agent 已存在同名 Session，导入将被拒绝（409 `trace_session_exists`），因此导入文件总是成为一个新 Session 的 001 号文件，并按首条记录时间戳的本地日期落入对应日期目录。
+
+Root 接口以整个 Session 为读取范围，因为逻辑 Trace 与物理 JSONL 分片相互独立。它只消费协议 v3
+显式的 `trace_begin` / `trace_end`、`agent.task` 和 `agent.step` 生命周期。对仅含 V1/v2 的 Session，
+清单返回 `{supported:false, protocolVersion:null, roots:[]}`，不会猜测 Goal 或 Task 边界；不存在显式
+root 时详情返回 404 `trace_root_not_found`。v3 详情结构为
+`{protocolVersion:3, root, tasks, records, subagents}`。子 Agent 链接保留无法解析的 Session pointer，
+只有显式可用时才补充 `agentId`、`childTraceId` 或 `childTaskId`。
+
+`/:index/turns` 接口永久保留既有的单分片、协议 v2 契约：只消费显式 `trace.turn_id` 和
+`agent.turn`，不从 `request_begin` / `request_end` 推断语义。其 `supported` 只描述该旧版分片，
+不能作为 v3 Root 能力标志。
 
 ### Session 级接口
 
@@ -180,7 +195,7 @@ Trace 下载对任意成员开放；导入仅限 owner（同 Agent 快照导入�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | / | Session 信息（单会话 GET 额外携带 `tracePath`：最新 Trace 文件的绝对路径；列表行不含） |
+| GET | / | Session 信息（单会话 GET 额外携带 `tracePath`：存在时为 v3 Session Trace bundle 的绝对路径；列表行不含） |
 | PATCH | / | 更新：`{approvalMode?, thinkingLevel?, archived?, title?}`。`thinkingLevel` 将思考等级固定在该 Session 上并持久化：此后凡是自身未携带等级的运行都改用它，而不再回落到 Agent 配置；读取时由 `SessionInfo.thinkingLevel` 返回（缺省即从未固定） |
 | DELETE | / | 删除 Session（连同 Trace 与暂存文件） |
 | GET | /messages | 完整 OmniMessage 历史；Task 运行期间响应额外携带 `live`（进行中的流式尾部，见下） |
@@ -202,7 +217,11 @@ Trace 下载对任意成员开放；导入仅限 owner（同 Agent 快照导入�
 | POST | /files/stat | 批量存在性检查：`{paths}` |
 | PUT | /files/content?path= | 上传文件：`{dataBase64}`，上限 14MB |
 | GET | /traces | 本 Session 的 Trace 文件列表 |
+| GET | /traces/roots | 跨整个 Session 读取协议 v3 的逻辑 Trace 根清单 |
+| GET | /traces/roots/:traceId | 读取一个 v3 逻辑 Trace 根，含 Task、Step、记录与子 Agent 链接 |
 | GET | /traces/:index | 读取 Trace 事件（分页） |
+| GET | /traces/:index/turns | 旧版：读取一个分片内协议 v2 的显式 ReAct Turn 清单 |
+| GET | /traces/:index/turns/:turnId | 旧版：读取一个 v2 Turn 的显式记录和子 Agent 导航目标 |
 | GET | /traces/:index/analysis | Trace 性能分析结果 |
 | GET | /scratchpad/:fileName | 读取会话暂存文件（如输入图片、文件附件） |
 
@@ -285,7 +304,7 @@ interface ApprovalDecisionRequest {
 }
 ```
 
-Web 的 `/model` 模型切换没有专用接口：它按 `/agent` 交接的方式复用上面的普通接口——先用会话创建接口在同一 Agent 下新建 Session（选定新模型并沿用源 Workspace），再 POST /tasks 发送以 `[model_switch_from]` 源块开头的首条消息（源会话 id、其 `tracePath`、Workspace 与原模型二元组），模型需要早前历史时自行读取该 Trace 文件。
+Web 的 `/model` 模型切换没有专用接口：它按 `/agent` 交接的方式复用上面的普通接口——先用会话创建接口在同一 Agent 下新建 Session（选定新模型并沿用源 Workspace），再 POST /tasks 发送以 `[model_switch_from]` 源块开头的首条消息（源会话 id、其 `tracePath`、Workspace 与原模型二元组），模型需要早前历史时自行读取该 Trace bundle。
 
 ## 流式接口（SSE）
 

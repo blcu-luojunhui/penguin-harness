@@ -35,15 +35,23 @@ import {
   assistantText,
   compactionBegin,
   compactionEnd,
+  createProtocolId,
   emptyTokenCounts,
   isCompleteModelMessage,
+  isEventMessage,
   isSessionMeta,
   partialText,
   requestBegin,
   requestEnd,
+  spanBegin,
+  spanEnd,
   subagentEvent,
+  traceBegin,
+  traceEnd,
   toolCallOutput,
   userText,
+  withProtocolIdentity,
+  withTraceContext,
 } from "../omnimessage/index.js";
 import {
   buildContextSummaryText,
@@ -64,6 +72,7 @@ import type {
   CompactionMode,
   CompactionReason,
   OmniMessage,
+  SpanKind,
   StopReason,
   TextPayload,
   ThinkingPayload,
@@ -71,6 +80,7 @@ import type {
   TokenUsagePayload,
   ToolCallOutputPayload,
   ToolCallPayload,
+  TraceContext,
 } from "../omnimessage/index.js";
 import type {
   ApproveFn,
@@ -83,8 +93,11 @@ import type {
 /** Trace sink: `write` a complete/event/meta message; `rotate` starts a new file (compaction splits files). */
 export interface TraceSink {
   write(msg: OmniMessage): Promise<void>;
-  /** Optional: start a new Trace file (index+1), used to record the new model context after compaction. */
-  rotate?(): Promise<void>;
+  /**
+   * Optional legacy physical-shard rotation. Return false when logical Trace storage keeps the
+   * same event source and therefore does not need session facts copied again.
+   */
+  rotate?(): Promise<void | false>;
 }
 
 /**
@@ -136,6 +149,16 @@ export interface RunOptions {
    * construction-time default (no override). Omitted = the LLM object's default.
    */
   thinkingLevel?: ThinkingLevelName;
+  /** Logical Trace/Task ownership supplied by Session. Omitted only for direct engine use. */
+  traceScope?: TaskTraceScope;
+  /** Event ids whose input envelopes the Session persisted before opening the Task Span. */
+  persistedInputEventIds?: ReadonlySet<string>;
+}
+
+/** Stable identity shared by every Step in one Task. */
+export interface TaskTraceScope {
+  traceId: string;
+  taskId: string;
 }
 
 /**
@@ -270,6 +293,15 @@ interface TurnResult {
   assistantSegments: OmniMessage[];
   /** Terminal state of this turn's LLM request (completed / failed / aborted / timeout / malformed). */
   outcome: LLMOutcome;
+}
+
+interface StepTraceContext extends TaskTraceScope {
+  stepId: string;
+  requestSpanId: string;
+  stepOpened: boolean;
+  requestOpened: boolean;
+  requestClosed: boolean;
+  stepClosed: boolean;
 }
 
 /**
@@ -433,6 +465,11 @@ export class ContextEngine {
   private steeringQueue: OmniMessage[][] = [];
   /** Whether a `run` is currently in flight (gates `steer`; compaction does not count). */
   private taskRunning = false;
+  /** Current Task ownership used to scope non-Span events before live/persisted emission. */
+  private activeTraceScope: TaskTraceScope | null = null;
+  /** Event ids known to have reached the Trace sink; synthetic retry inputs use snapshots. */
+  private readonly persistedEventTraces = new Map<string, string>();
+  private activeOperation: symbol | null = null;
 
   constructor(private readonly deps: ContextEngineDeps) {
     this.pendingBootstrapRecords = deps.bootstrapRecords ?? null;
@@ -462,14 +499,107 @@ export class ContextEngine {
    * Docs: /docs/agent-loop § "The loop at a glance".
    */
   async *run(newMessages: OmniMessage[], opts?: RunOptions): AsyncGenerator<OmniMessage> {
+    const operation = this.acquireOperation("run");
     // Steering window: only while this generator is being driven. The finally also covers
     // abort/failure exits — anything still queued is discarded (see steeringQueue).
+    const scope =
+      opts?.traceScope ??
+      (() => {
+        const taskId = createProtocolId();
+        return { traceId: taskId, taskId };
+      })();
+    const ownsTaskLifecycle = opts?.traceScope === undefined;
+    newMessages = newMessages.map(withProtocolIdentity);
+    for (const eventId of opts?.persistedInputEventIds ?? []) {
+      this.persistedEventTraces.set(eventId, scope.traceId);
+    }
     this.taskRunning = true;
+    this.activeTraceScope = scope;
+    let status: StopReason = "completed";
+    let completedNormally = false;
+    let lifecycleBegins: [OmniMessage, OmniMessage] | null = null;
+    if (ownsTaskLifecycle) {
+      const root = traceBegin({ rootKind: "task", traceId: scope.traceId, taskId: scope.taskId });
+      await this.write(root);
+      if (this.pendingSummary) await this.write(this.pendingSummary);
+      for (const message of newMessages) {
+        if (!message.event_id || !this.persistedEventTraces.has(message.event_id)) {
+          await this.write(message);
+        }
+      }
+      const task = spanBegin({
+        kind: "agent.task",
+        traceId: scope.traceId,
+        taskId: scope.taskId,
+        spanId: scope.taskId,
+        attributes: this.inputAudit(newMessages, scope.traceId),
+      });
+      await this.write(task);
+      lifecycleBegins = [root, task];
+    }
     try {
-      yield* this.runToCompletion(newMessages, opts);
+      if (lifecycleBegins) {
+        yield lifecycleBegins[0];
+        yield lifecycleBegins[1];
+      }
+      for await (const raw of this.runToCompletion(newMessages, opts)) {
+        const msg = this.contextualize(raw);
+        if (isEventMessage(msg) && msg.payload.type === "abort" && status === "completed") {
+          status = "aborted";
+        }
+        if (
+          isEventMessage(msg) &&
+          msg.payload.type === "span_end" &&
+          msg.payload.span_kind === "agent.step" &&
+          msg.payload.status !== "completed" &&
+          msg.payload.status !== "skipped"
+        ) {
+          status = msg.payload.status;
+        }
+        if (
+          isCompleteModelMessage(msg) &&
+          msg.payload.type === "text" &&
+          msg.payload.role === "assistant" &&
+          msg.payload.stop_reason &&
+          msg.payload.stop_reason !== "completed"
+        ) {
+          status = msg.payload.stop_reason;
+        }
+        yield msg;
+      }
+      completedNormally = true;
+    } catch (error) {
+      status = "failed";
+      throw error;
     } finally {
+      if (!completedNormally && status === "completed") status = "aborted";
+      let terminalMessages: [OmniMessage, OmniMessage] | null = null;
+      if (ownsTaskLifecycle) {
+        const taskEnd = spanEnd({
+          kind: "agent.task",
+          traceId: scope.traceId,
+          taskId: scope.taskId,
+          spanId: scope.taskId,
+          status,
+        });
+        await this.write(taskEnd);
+        const rootEnd = traceEnd({
+          rootKind: "task",
+          traceId: scope.traceId,
+          taskId: scope.taskId,
+          status,
+        });
+        await this.write(rootEnd);
+        terminalMessages = [taskEnd, rootEnd];
+      }
       this.taskRunning = false;
       this.steeringQueue = [];
+      this.activeTraceScope = null;
+      this.releaseOperation(operation);
+      if (terminalMessages && completedNormally) {
+        yield terminalMessages[0];
+        yield terminalMessages[1];
+      }
     }
   }
 
@@ -525,8 +655,8 @@ export class ContextEngine {
     const messages: OmniMessage[] = [];
     for (const input of drained) messages.push(...(await this.steeringMessages(input)));
     for (const msg of messages) {
-      yield msg;
       await this.write(msg);
+      yield msg;
     }
     return messages;
   }
@@ -570,6 +700,10 @@ export class ContextEngine {
     opts?: RunOptions,
   ): AsyncGenerator<OmniMessage> {
     const signal = opts?.signal;
+    // SDK consumers may inject legacy-shaped messages directly instead of using builders. Stamp
+    // identity before the first Trace write so any input_event_ids emitted below resolve to the
+    // same records on disk.
+    newMessages = newMessages.map(withProtocolIdentity);
     // Default approval policy: deny (conservative). CLI/Web will inject a real callback (interactive or permission-mode based).
     const approve: ApproveFn = opts?.approve ?? (async () => "deny");
     // Per-turn thinking level: applies to each of this run's LLM requests (reconnects included);
@@ -593,8 +727,12 @@ export class ContextEngine {
     // messages, and resumption replay best-effort reconstructs from original messages.
     // Exception: the compaction summary, which is the new
     // context's first input record, is written as usual.
-    if (summary) await this.write(summary);
-    for (const msg of newMessages) await this.write(msg);
+    if (summary && (!summary.event_id || !this.persistedEventTraces.has(summary.event_id))) {
+      await this.write(summary);
+    }
+    for (const msg of newMessages) {
+      if (!msg.event_id || !this.persistedEventTraces.has(msg.event_id)) await this.write(msg);
+    }
     if (this.pendingBootstrapRecords) {
       // First run only: the connect pair, then the toolset record, follow the input into
       // the Trace (see ContextEngineDeps.bootstrapRecords for the ordering rationale).
@@ -637,189 +775,309 @@ export class ContextEngine {
       }
       turnCount += 1;
 
-      // This turn's input. The safety invariant behind resending it: **no retryable attempt
-      // is ever committed to AgentHub's history**. AgentHub appends a turn to `_history` only
-      // after its stream has been consumed to the end and validated, so every abnormal exit —
-      // `timeout`, `malformed` and `failed` alike, whether the stream was cut, the payload
-      // failed to parse, or the request was rejected outright — leaves history untouched.
-      // Nothing can therefore be duplicated or left as an unanswered tool_use by a reconnect;
-      // that is what makes it safe to resend this turn's input unchanged, appending a
-      // `[turn_retried]` block carrying what the failed attempt already produced — the model
-      // continues from there instead of re-running tools; the tag is distinct from the
-      // user-interruption `[turn_aborted]`. (The one attempt that IS committed — a fully
-      // delivered response whose finish_reason arrived — is forced to `completed` in
-      // GenerativeModel precisely so it never reaches this loop.)
-      const failedTurns: TurnResult[] = [];
-      let attemptInput = nextInput;
-      let reconnects = 0;
-      let turn: TurnResult;
+      // One graph root per logical ReAct Turn. The logical Request remains open across all
+      // automatic reconnect Attempts; tools are sibling Spans under this Turn.
+      const scope = this.activeTraceScope;
+      if (!scope) throw new Error("ContextEngine run is missing an active Trace scope");
+      const traceContext: StepTraceContext = {
+        ...scope,
+        stepId: createProtocolId(),
+        requestSpanId: createProtocolId(),
+        stepOpened: false,
+        requestOpened: false,
+        requestClosed: false,
+        stepClosed: false,
+      };
+      const initialInputAudit = this.inputAudit(nextInput, traceContext.traceId);
+      try {
+        yield* this.emitTraceSpanBegin(
+          {
+            kind: "agent.step",
+            ...traceContext,
+            spanId: traceContext.stepId,
+            parentSpanId: traceContext.taskId,
+            attributes: initialInputAudit,
+          },
+          () => {
+            traceContext.stepOpened = true;
+          },
+        );
+        yield* this.emitTraceSpanBegin(
+          {
+            kind: "llm.request",
+            ...traceContext,
+            spanId: traceContext.requestSpanId,
+            parentSpanId: traceContext.stepId,
+            attributes: initialInputAudit,
+          },
+          () => {
+            traceContext.requestOpened = true;
+          },
+        );
 
-      for (;;) {
-        // Both LLM and Environment handle errors internally and guarantee a complete, closed
-        // output with no thrown exceptions; the engine doesn't handle exceptions —
-        // it decides retry/resend purely from `outcome`. The retry count so far is threaded
-        // in so the turn's request_end can announce the planned backoff (retry_in_ms) —
-        // the counter lives in this loop while the event is built inside the turn.
-        turn = yield* this.runTurn(attemptInput, approve, signal, thinkingLevel, reconnects);
+        // This turn's input. The safety invariant behind resending it: **no retryable attempt
+        // is ever committed to AgentHub's history**. AgentHub appends a turn to `_history` only
+        // after its stream has been consumed to the end and validated, so every abnormal exit —
+        // `timeout`, `malformed` and `failed` alike, whether the stream was cut, the payload
+        // failed to parse, or the request was rejected outright — leaves history untouched.
+        // Nothing can therefore be duplicated or left as an unanswered tool_use by a reconnect;
+        // that is what makes it safe to resend this turn's input unchanged, appending a
+        // `[turn_retried]` block carrying what the failed attempt already produced — the model
+        // continues from there instead of re-running tools; the tag is distinct from the
+        // user-interruption `[turn_aborted]`. (The one attempt that IS committed — a fully
+        // delivered response whose finish_reason arrived — is forced to `completed` in
+        // GenerativeModel precisely so it never reaches this loop.)
+        const failedTurns: TurnResult[] = [];
+        let attemptInput = nextInput;
+        let reconnects = 0;
+        let turn: TurnResult;
 
-        // User interruption (the LLM stream was aborted, outcome=aborted, or `signal` fired
-        // during tool execution): stop and hand control back to the user.
-        if (signal?.aborted || turn.outcome.status === "aborted") {
-          this.pendingCarryOver = this.buildCarryOver(attemptInput, turn);
-          yield* this.emitAbort("aborted by user");
-          return;
-        }
-        // `auth` is the one status that stops the run: a rejected credential cannot be retried
-        // into working, and hosts read it off the turn's request_end to gate input. Everything
-        // else — `failed` included — goes to the reconnect loop below.
-        if (turn.outcome.status === "auth") {
-          this.pendingCarryOver = this.buildCarryOver(attemptInput, turn);
-          yield* this.emitAbort(`llm request error: ${turn.outcome.errorMessage ?? "unknown"}`);
-          return;
-        }
-        // A permanent `failed` is the other non-retried terminal: a deterministic
-        // client-side rejection thrown before any network I/O (fast_mode on a model
-        // without a fast tier — see LLMOutcome.permanent), where the identical request can
-        // never succeed and the fix is a config change. The general retry-everything
-        // rationale below doesn't apply: this isn't a gateway phrasing a transient fault
-        // its own way, it's AgentHub's own typed error, so the ladder would only delay the
-        // actionable message.
-        if (turn.outcome.status === "failed" && turn.outcome.permanent) {
-          this.pendingCarryOver = this.buildCarryOver(attemptInput, turn);
-          yield* this.emitAbort(`llm request error: ${turn.outcome.errorMessage ?? "unknown"}`);
-          return;
-        }
-        // Completed normally.
-        if (turn.outcome.status === "completed") break;
+        for (;;) {
+          // Both LLM and Environment handle errors internally and guarantee a complete, closed
+          // output with no thrown exceptions; the engine doesn't handle exceptions —
+          // it decides retry/resend purely from `outcome`. The retry count so far is threaded
+          // in so the turn's request_end can announce the planned backoff (retry_in_ms) —
+          // the counter lives in this loop while the event is built inside the turn.
+          turn = yield* this.runTurn(
+            attemptInput,
+            approve,
+            traceContext,
+            signal,
+            thinkingLevel,
+            reconnects,
+          );
 
-        // failed / timeout / malformed remain: reconnect automatically within the same run.
-        //
-        // `failed` retries too, even though the classifier judged it non-transient. That
-        // judgement is a hint, not a verdict: it is an allowlist of known network codes,
-        // statuses and message vocabulary, so every gateway that phrases a transient failure
-        // its own way falls through it — `Upstream HTTP/2 stream failed
-        // (upstream_http2_stream_error)` is plainly a transport fault and matched nothing.
-        // Retrying a genuinely permanent error costs the ladder and then ends the same way;
-        // aborting a transient one destroys the turn. So the *classification* stays honest
-        // (`failed` is still recorded as a real failure, not relabelled a timeout) while the
-        // *policy* retries it. Only `auth` is terminal, above.
-        //
-        // When retries are exhausted or the backoff is interrupted, the retry input is held
-        // as-is as carry-over (the original input is already written to Trace, so it isn't
-        // rewritten). The frontend surfaces the retry process and count via
-        // request_end(failed|timeout|malformed) followed by the next request_begin.
-        failedTurns.push(turn);
-        attemptInput = this.withRetriedTurns(nextInput, failedTurns);
-        if (reconnects >= this.maxReconnects) {
-          this.pendingCarryOver = attemptInput;
-          // This reason is user-visible (the Web App's error panel, the CLI's abort line) and
-          // is what observability persists as the error message, so it has to read as a
-          // sentence: what gave out, then how many attempts it took, then — for the one class
-          // that carries provider words worth showing — the detail, last.
-          const reason =
-            turn.outcome.status === "malformed"
-              ? `malformed response failed after ${this.maxReconnects} retries`
-              : turn.outcome.status === "failed"
-                ? `llm request failed after ${this.maxReconnects} retries: ${turn.outcome.errorMessage ?? "unknown"}`
-                : `reconnect failed after ${this.maxReconnects} retries`;
-          yield* this.emitAbort(reason);
-          return;
-        }
-        reconnects += 1;
-        if (!(await this.backoff(reconnects, signal))) {
-          this.pendingCarryOver = attemptInput;
-          yield* this.emitAbort("aborted during reconnect backoff");
-          return;
-        }
-      }
-
-      // Compaction checkpoint: after every LLM Request produces token_usage. This also
-      // applies mid-Task — when runTurn returns, all of this turn's
-      // tool results are ready and paired with their tool_call.
-      const midTask = turn.toolOutputs.length > 0;
-      const compactionReason = this.compactionTrigger();
-      if (compactionReason) {
-        const mode = this.deps.compaction!.mode;
-        if (mode === "discard") {
-          // Once discarded, the current Task can't continue: defer until the Task really
-          // ends (mid-Task, or steering still queued that must continue the loop). The
-          // queue is only peeked here — delivery happens at the input assembly below.
-          if (!midTask && this.steeringQueue.length === 0) {
-            yield* this.discardContext(compactionReason);
+          // User interruption (the LLM stream was aborted, outcome=aborted, or `signal` fired
+          // during tool execution): stop and hand control back to the user.
+          if (signal?.aborted || turn.outcome.status === "aborted") {
+            yield* this.emitTraceTurnEnd(traceContext, {
+              requestStatus: turn.outcome.status,
+              turnStatus: "aborted",
+              ...(turn.outcome.errorMessage !== undefined
+                ? { errorMessage: turn.outcome.errorMessage }
+                : {}),
+            });
+            this.pendingCarryOver = this.buildCarryOver(attemptInput, turn);
+            yield* this.emitAbort("aborted by user");
             return;
           }
-        } else {
-          const result = yield* this.summarizeContext(
-            compactionReason,
-            midTask ? turn.toolOutputs : [],
-            signal,
-          );
-          if (result.status === "completed") {
-            // Boundary check against the **live** queue: steering may have arrived during
-            // the multi-second compaction request and must not be swallowed (no await sits
-            // between this check and the return, so the window cannot reopen).
+          // `auth` is the one status that stops the run: a rejected credential cannot be retried
+          // into working, and hosts read it off the turn's request_end to gate input. Everything
+          // else — `failed` included — goes to the reconnect loop below.
+          if (turn.outcome.status === "auth") {
+            yield* this.emitTraceTurnEnd(traceContext, {
+              requestStatus: "auth",
+              turnStatus: "auth",
+              ...(turn.outcome.errorMessage !== undefined
+                ? { errorMessage: turn.outcome.errorMessage }
+                : {}),
+            });
+            this.pendingCarryOver = this.buildCarryOver(attemptInput, turn);
+            yield* this.emitAbort(`llm request error: ${turn.outcome.errorMessage ?? "unknown"}`);
+            return;
+          }
+          // A permanent `failed` is the other non-retried terminal: a deterministic
+          // client-side rejection thrown before any network I/O (fast_mode on a model
+          // without a fast tier — see LLMOutcome.permanent), where the identical request can
+          // never succeed and the fix is a config change. The general retry-everything
+          // rationale below doesn't apply: this isn't a gateway phrasing a transient fault
+          // its own way, it's AgentHub's own typed error, so the ladder would only delay the
+          // actionable message.
+          if (turn.outcome.status === "failed" && turn.outcome.permanent) {
+            yield* this.emitTraceTurnEnd(traceContext, {
+              requestStatus: "failed",
+              turnStatus: "failed",
+              ...(turn.outcome.errorMessage !== undefined
+                ? { errorMessage: turn.outcome.errorMessage }
+                : {}),
+            });
+            this.pendingCarryOver = this.buildCarryOver(attemptInput, turn);
+            yield* this.emitAbort(`llm request error: ${turn.outcome.errorMessage ?? "unknown"}`);
+            return;
+          }
+          // Completed normally.
+          if (turn.outcome.status === "completed") break;
+
+          // failed / timeout / malformed remain: reconnect automatically within the same run.
+          //
+          // `failed` retries too, even though the classifier judged it non-transient. That
+          // judgement is a hint, not a verdict: it is an allowlist of known network codes,
+          // statuses and message vocabulary, so every gateway that phrases a transient failure
+          // its own way falls through it — `Upstream HTTP/2 stream failed
+          // (upstream_http2_stream_error)` is plainly a transport fault and matched nothing.
+          // Retrying a genuinely permanent error costs the ladder and then ends the same way;
+          // aborting a transient one destroys the turn. So the *classification* stays honest
+          // (`failed` is still recorded as a real failure, not relabelled a timeout) while the
+          // *policy* retries it. Only `auth` is terminal, above.
+          //
+          // When retries are exhausted or the backoff is interrupted, the retry input is held
+          // as-is as carry-over (the original input is already written to Trace, so it isn't
+          // rewritten). The frontend surfaces the retry process and count via
+          // request_end(failed|timeout|malformed) followed by the next request_begin.
+          failedTurns.push(turn);
+          attemptInput = this.withRetriedTurns(nextInput, failedTurns);
+          if (reconnects >= this.maxReconnects) {
+            yield* this.emitTraceTurnEnd(traceContext, {
+              requestStatus: turn.outcome.status,
+              turnStatus: turn.outcome.status,
+              ...(turn.outcome.errorMessage !== undefined
+                ? { errorMessage: turn.outcome.errorMessage }
+                : {}),
+            });
+            this.pendingCarryOver = attemptInput;
+            // This reason is user-visible (the Web App's error panel, the CLI's abort line) and
+            // is what observability persists as the error message, so it has to read as a
+            // sentence: what gave out, then how many attempts it took, then — for the one class
+            // that carries provider words worth showing — the detail, last.
+            const reason =
+              turn.outcome.status === "malformed"
+                ? `malformed response failed after ${this.maxReconnects} retries`
+                : turn.outcome.status === "failed"
+                  ? `llm request failed after ${this.maxReconnects} retries: ${turn.outcome.errorMessage ?? "unknown"}`
+                  : `reconnect failed after ${this.maxReconnects} retries`;
+            yield* this.emitAbort(reason);
+            return;
+          }
+          reconnects += 1;
+          if (!(await this.backoff(reconnects, signal))) {
+            yield* this.emitTraceTurnEnd(traceContext, {
+              requestStatus: "aborted",
+              turnStatus: "aborted",
+              errorMessage: "aborted during reconnect backoff",
+            });
+            this.pendingCarryOver = attemptInput;
+            yield* this.emitAbort("aborted during reconnect backoff");
+            return;
+          }
+        }
+
+        // runTurn returns only after every tool it dispatched has settled, so the Turn is complete
+        // here. Close it before the compaction checkpoint: compaction is a between-Turn transition.
+        yield* this.emitTraceTurnEnd(traceContext, {
+          requestStatus: "completed",
+          turnStatus: "completed",
+        });
+
+        // Compaction checkpoint: after every LLM Request produces token_usage. This also
+        // applies mid-Task — when runTurn returns, all of this turn's
+        // tool results are ready and paired with their tool_call.
+        const midTask = turn.toolOutputs.length > 0;
+        const compactionReason = this.compactionTrigger();
+        if (compactionReason) {
+          const mode = this.deps.compaction!.mode;
+          if (mode === "discard") {
+            // Once discarded, the current Task can't continue: defer until the Task really
+            // ends (mid-Task, or steering still queued that must continue the loop). The
+            // queue is only peeked here — delivery happens at the input assembly below.
             if (!midTask && this.steeringQueue.length === 0) {
-              // Task boundary: the summary is merged with the next user Prompt as the new
-              // context's first input.
-              this.pendingSummary = result.summary!;
+              yield* this.discardContext(compactionReason);
               return;
             }
-            // Mid-Task: the summary itself becomes the new LLM object's first input (this
-            // turn's tool results were already folded into the compaction request and absorbed
-            // into the summary); continuation relies on the model's own next-step plan written
-            // into the summary, with no hardcoded continuation instruction appended. Queued
-            // steering (including anything that arrived during the compaction request) is
-            // delivered right after the summary as standalone [user_steering] user turns.
-            await this.write(result.summary!);
-            const steering = yield* this.deliverSteering();
-            nextInput = [result.summary!, ...steering];
-            continue;
-          }
-          // failed or aborted: keep the original context and Trace index — the compaction is
-          // made up later, at the next trigger or a manual /compact (no fallback to
-          // discard). Mid-Task the run ends through the interruption flow: this turn's
-          // pending state is held as carry-over under the same two-case binary as everywhere
-          // (issue #85) — a committed attempt consumed the turn's outputs into history, so
-          // only the repair stash summarizeContext left in pendingCarryOver still needs
-          // resending; otherwise the outputs are untouched and are appended behind the stash
-          // as case-A carry-over. The next run resends that carry-over merged with the
-          // user's message, exactly like any interrupted turn, and the still-standing
-          // threshold re-triggers the compaction there. The abort also discards the steering
-          // queue (run's finally — control goes back to the user).
-          if (midTask) {
-            if (!result.committed) {
-              this.pendingCarryOver = [
-                ...this.pendingCarryOver,
-                ...this.buildCarryOver(attemptInput, turn),
-              ];
-            }
-            yield* this.emitAbort(
-              result.status === "aborted" ? "aborted during compaction" : "compaction failed",
+          } else {
+            const result = yield* this.summarizeContext(
+              compactionReason,
+              midTask ? turn.toolOutputs : [],
+              signal,
             );
-            return;
+            if (result.status === "completed") {
+              // Boundary check against the **live** queue: steering may have arrived during
+              // the multi-second compaction request and must not be swallowed (no await sits
+              // between this check and the return, so the window cannot reopen).
+              if (!midTask && this.steeringQueue.length === 0) {
+                // Task boundary: the summary is merged with the next user Prompt as the new
+                // context's first input.
+                this.pendingSummary = result.summary!;
+                return;
+              }
+              // Mid-Task: the summary itself becomes the new LLM object's first input (this
+              // turn's tool results were already folded into the compaction request and absorbed
+              // into the summary); continuation relies on the model's own next-step plan written
+              // into the summary, with no hardcoded continuation instruction appended. Queued
+              // steering (including anything that arrived during the compaction request) is
+              // delivered right after the summary as standalone [user_steering] user turns.
+              await this.write(result.summary!);
+              const steering = yield* this.deliverSteering();
+              nextInput = [result.summary!, ...steering];
+              continue;
+            }
+            // failed or aborted: keep the original context and Trace index — the compaction is
+            // made up later, at the next trigger or a manual /compact (no fallback to
+            // discard). Mid-Task the run ends through the interruption flow: this turn's
+            // pending state is held as carry-over under the same two-case binary as everywhere
+            // (issue #85) — a committed attempt consumed the turn's outputs into history, so
+            // only the repair stash summarizeContext left in pendingCarryOver still needs
+            // resending; otherwise the outputs are untouched and are appended behind the stash
+            // as case-A carry-over. The next run resends that carry-over merged with the
+            // user's message, exactly like any interrupted turn, and the still-standing
+            // threshold re-triggers the compaction there. The abort also discards the steering
+            // queue (run's finally — control goes back to the user).
+            if (midTask) {
+              if (!result.committed) {
+                this.pendingCarryOver = [
+                  ...this.pendingCarryOver,
+                  ...this.buildCarryOver(attemptInput, turn),
+                ];
+              }
+              yield* this.emitAbort(
+                result.status === "aborted" ? "aborted during compaction" : "compaction failed",
+              );
+              return;
+            }
+            // Task boundary: the final reply has already streamed out. A user abort hands
+            // control straight back; a failure falls through — queued steering may still
+            // continue the loop, and the assembly below otherwise ends the run.
+            if (result.status === "aborted") return;
           }
-          // Task boundary: the final reply has already streamed out. A user abort hands
-          // control straight back; a failure falls through — queued steering may still
-          // continue the loop, and the assembly below otherwise ends the run.
-          if (result.status === "aborted") return;
+        }
+
+        // Next-input assembly — the steering delivery point: everything queued so far becomes
+        // standalone [user_steering] user messages riding alongside this turn's tool outputs
+        // (or alone as the continuation input when the turn produced no tool calls, instead of
+        // ending the Task — subject to the max-turns guard at the top of the loop).
+        const steering = yield* this.deliverSteering();
+        // No tool_call this turn and no steering left -> the Task ends (the final reply has
+        // already been streamed out). A compaction stash, if any, rides the next run.
+        if (!midTask && steering.length === 0) return;
+        // Anything a failed boundary compaction stashed (synthesized repair outputs from
+        // rejected attempts) rides the very next request, ahead of the turn outputs so
+        // tool_results stay contiguous and first.
+        const stashed = this.pendingCarryOver;
+        this.pendingCarryOver = [];
+        nextInput = [...stashed, ...turn.toolOutputs, ...steering];
+        if (nextInput.length === 0) return;
+      } finally {
+        // Async-generator cancellation enters here before Session closes its Task/root. Wait for
+        // runTurn's own finally (via yield*) first, then persist the remaining ancestors from
+        // inner to outer without yielding more live records to a consumer that has returned.
+        if (traceContext.requestOpened && !traceContext.requestClosed) {
+          await this.write(
+            spanEnd({
+              kind: "llm.request",
+              traceId: traceContext.traceId,
+              taskId: traceContext.taskId,
+              stepId: traceContext.stepId,
+              spanId: traceContext.requestSpanId,
+              parentSpanId: traceContext.stepId,
+              status: "aborted",
+            }),
+          );
+          traceContext.requestClosed = true;
+        }
+        if (traceContext.stepOpened && !traceContext.stepClosed) {
+          await this.write(
+            spanEnd({
+              kind: "agent.step",
+              traceId: traceContext.traceId,
+              taskId: traceContext.taskId,
+              stepId: traceContext.stepId,
+              spanId: traceContext.stepId,
+              parentSpanId: traceContext.taskId,
+              status: "aborted",
+            }),
+          );
+          traceContext.stepClosed = true;
         }
       }
-
-      // Next-input assembly — the steering delivery point: everything queued so far becomes
-      // standalone [user_steering] user messages riding alongside this turn's tool outputs
-      // (or alone as the continuation input when the turn produced no tool calls, instead of
-      // ending the Task — subject to the max-turns guard at the top of the loop).
-      const steering = yield* this.deliverSteering();
-      // No tool_call this turn and no steering left -> the Task ends (the final reply has
-      // already been streamed out). A compaction stash, if any, rides the next run.
-      if (!midTask && steering.length === 0) return;
-      // Anything a failed boundary compaction stashed (synthesized repair outputs from
-      // rejected attempts) rides the very next request, ahead of the turn outputs so
-      // tool_results stay contiguous and first.
-      const stashed = this.pendingCarryOver;
-      this.pendingCarryOver = [];
-      nextInput = [...stashed, ...turn.toolOutputs, ...steering];
-      if (nextInput.length === 0) return;
     }
   }
 
@@ -857,42 +1115,66 @@ export class ContextEngine {
     return this.fromCompaction ? "just_compacted" : "empty";
   }
 
-  async *compact(opts?: { signal?: AbortSignal }): AsyncGenerator<OmniMessage> {
-    if (!this.deps.compaction || !this.deps.createLLM) return;
-    // The current context has no completed LLM turns: nothing to compact, return immediately.
-    // This also guards against two /compact calls in a row — the new context is empty right
-    // after the previous compaction, so running again would overwrite the not-yet-consumed
-    // pendingSummary with an "empty summary," permanently losing the only record of the prior
-    // conversation.
-    if (this.sessionTurns === 0) return;
-    if (this.deps.compaction.mode === "discard") {
-      this.pendingCarryOver = this.pendingCarryOver.filter(
-        (m) => (m.payload as { type?: string }).type !== "tool_call_output",
-      );
-      yield* this.discardContext("manual");
-      return;
+  async *compact(opts?: {
+    signal?: AbortSignal;
+    traceScope?: TaskTraceScope;
+  }): AsyncGenerator<OmniMessage> {
+    const operation = this.acquireOperation("compact");
+    const previousScope = this.activeTraceScope;
+    if (opts?.traceScope) this.activeTraceScope = opts.traceScope;
+    try {
+      if (!this.deps.compaction || !this.deps.createLLM) return;
+      // The current context has no completed LLM turns: nothing to compact, return immediately.
+      // This also guards against two /compact calls in a row — the new context is empty right
+      // after the previous compaction, so running again would overwrite the not-yet-consumed
+      // pendingSummary with an "empty summary," permanently losing the only record of the prior
+      // conversation.
+      if (this.sessionTurns === 0) return;
+      if (this.deps.compaction.mode === "discard") {
+        this.pendingCarryOver = this.pendingCarryOver.filter(
+          (m) => (m.payload as { type?: string }).type !== "tool_call_output",
+        );
+        yield* this.discardContext("manual");
+        return;
+      }
+      // The carry seam is a clean binary on whether the compaction committed anything to
+      // AgentHub (PR #87 review):
+      //   - nothing committed (every attempt timeout/malformed/failed/auth/aborted): the fold
+      //     never reached the model context — restore the prior carry-over **verbatim**. Zero
+      //     committed attempts also means zero synthesized repairs, so there is no stash to
+      //     interleave with (pinned by tests);
+      //   - something committed: the carry-over is **consumed** — it lives in the committed
+      //     history now and must never be resent; only the repair stash (unanswered tool_call
+      //     pairing left by a final rejection, already in pendingCarryOver) remains pending.
+      // Dead-goal rounds are downgraded on the drained snapshot (goal mode's consumer-site
+      // rule): a no-commit restore keeps the downgraded copies — the downgrade is idempotent
+      // and every consumer applies it anyway, while non-goal messages keep their identity.
+      const folded = this.pendingCarryOver.map(downgradeCarriedGoalInput);
+      this.pendingCarryOver = [];
+      const result = yield* this.summarizeContext("manual", folded, opts?.signal);
+      if (result.status === "completed") {
+        this.pendingSummary = result.summary!;
+      } else if (!result.committed) {
+        this.pendingCarryOver = folded;
+      }
+      // committed but not completed: the carry-over is deliberately not restored.
+    } finally {
+      this.activeTraceScope = previousScope;
+      this.releaseOperation(operation);
     }
-    // The carry seam is a clean binary on whether the compaction committed anything to
-    // AgentHub (PR #87 review):
-    //   - nothing committed (every attempt timeout/malformed/failed/auth/aborted): the fold
-    //     never reached the model context — restore the prior carry-over **verbatim**. Zero
-    //     committed attempts also means zero synthesized repairs, so there is no stash to
-    //     interleave with (pinned by tests);
-    //   - something committed: the carry-over is **consumed** — it lives in the committed
-    //     history now and must never be resent; only the repair stash (unanswered tool_call
-    //     pairing left by a final rejection, already in pendingCarryOver) remains pending.
-    // Dead-goal rounds are downgraded on the drained snapshot (goal mode's consumer-site
-    // rule): a no-commit restore keeps the downgraded copies — the downgrade is idempotent
-    // and every consumer applies it anyway, while non-goal messages keep their identity.
-    const folded = this.pendingCarryOver.map(downgradeCarriedGoalInput);
-    this.pendingCarryOver = [];
-    const result = yield* this.summarizeContext("manual", folded, opts?.signal);
-    if (result.status === "completed") {
-      this.pendingSummary = result.summary!;
-    } else if (!result.committed) {
-      this.pendingCarryOver = folded;
+  }
+
+  private acquireOperation(kind: "run" | "compact"): symbol {
+    if (this.activeOperation) {
+      throw new Error(`ContextEngine is busy; cannot start ${kind}`);
     }
-    // committed but not completed: the carry-over is deliberately not restored.
+    const owner = Symbol(kind);
+    this.activeOperation = owner;
+    return owner;
+  }
+
+  private releaseOperation(owner: symbol): void {
+    if (this.activeOperation === owner) this.activeOperation = null;
   }
 
   /**
@@ -986,6 +1268,7 @@ export class ContextEngine {
   private async *runTurn(
     input: OmniMessage[],
     approve: ApproveFn,
+    traceContext: StepTraceContext,
     signal?: AbortSignal,
     thinkingLevel?: ThinkingLevelName,
     /** Retries already performed for this turn (from the caller's reconnect loop): lets request_end announce the NEXT attempt's planned backoff. */
@@ -1001,31 +1284,120 @@ export class ContextEngine {
     // This turn's complete thinking/text segments produced by the model (including partial
     // segments finalized on interruption), for carry-over flatten.
     const assistantSegments: OmniMessage[] = [];
+    // A turn owns every physical producer it starts. The caller's signal is mirrored into an
+    // internal controller, while generator.return() aborts the same controller even when the
+    // host did not provide a signal. No Task/root terminal may be persisted until these
+    // producers have observed that abort and settled.
+    const turnAbort = new AbortController();
+    const abortTurn = (): void => {
+      if (!turnAbort.signal.aborted) {
+        turnAbort.abort(signal?.reason ?? new Error("turn consumer cancelled"));
+      }
+    };
+    if (signal?.aborted) abortTurn();
+    else signal?.addEventListener("abort", abortTurn, { once: true });
+
     // This turn's LLM terminal state: taken from streamGenerate's generator return value.
     let outcome: LLMOutcome = { status: "completed" };
+    let attemptSpanId: string | undefined;
+    let attemptTrace: TraceContext | undefined;
+    let attemptOpened = false;
+    let requestBoundaryOpened = false;
+    let attemptClosePromise: Promise<void> | null = null;
+    let modelGenerator: AsyncGenerator<OmniMessage, LLMOutcome> | null = null;
+    let driveSettled = false;
+    const toolRuns: Promise<void>[] = [];
+
+    const closeAttempt = (
+      terminal: LLMOutcome,
+      options: { publish: boolean; retryInMs?: number },
+    ): Promise<void> => {
+      if (!attemptOpened || !attemptTrace || !attemptSpanId) return Promise.resolve();
+      if (attemptClosePromise) return attemptClosePromise;
+      attemptClosePromise = (async () => {
+        if (requestBoundaryOpened) {
+          const stopEvt = withTraceContext(
+            requestEnd(terminal.status, {
+              ...(terminal.errorMessage !== undefined
+                ? { errorMessage: terminal.errorMessage }
+                : {}),
+              ...(terminal.status !== "completed" || reconnectsSoFar > 0
+                ? { attempt: reconnectsSoFar + 1 }
+                : {}),
+              ...(options.retryInMs !== undefined ? { retryInMs: options.retryInMs } : {}),
+            }),
+            attemptTrace!,
+          );
+          await this.write(stopEvt);
+          if (options.publish) queue.push(stopEvt);
+          requestBoundaryOpened = false;
+        }
+        const attemptEnd = spanEnd({
+          kind: "llm.attempt",
+          traceId: traceContext.traceId,
+          taskId: traceContext.taskId,
+          stepId: traceContext.stepId,
+          spanId: attemptSpanId!,
+          parentSpanId: traceContext.requestSpanId,
+          status: terminal.status,
+          ...(terminal.errorMessage !== undefined ? { errorMessage: terminal.errorMessage } : {}),
+        });
+        await this.write(attemptEnd);
+        if (options.publish) queue.push(attemptEnd);
+      })();
+      return attemptClosePromise;
+    };
 
     // Driver task: consumes the LLM stream + approves one at a time + dispatches tool
     // execution. It is itself a producer.
     queue.addProducer();
     const drive = (async () => {
       try {
+        attemptSpanId = createProtocolId();
+        attemptTrace = {
+          trace_id: traceContext.traceId,
+          task_id: traceContext.taskId,
+          step_id: traceContext.stepId,
+          span_id: attemptSpanId,
+          parent_span_id: traceContext.requestSpanId,
+        };
+        const attemptStart = spanBegin({
+          kind: "llm.attempt",
+          traceId: traceContext.traceId,
+          taskId: traceContext.taskId,
+          stepId: traceContext.stepId,
+          spanId: attemptSpanId,
+          parentSpanId: traceContext.requestSpanId,
+          attributes: {
+            ...this.inputAudit(input, traceContext.traceId),
+            attempt: reconnectsSoFar + 1,
+          },
+        });
+        await this.write(attemptStart);
+        attemptOpened = true;
+        queue.push(attemptStart);
         // Request boundary events (replayability): start is
         // emitted when the request is issued, stop carries the terminal state at completion —
         // replay mechanically determines from these whether the turn was committed by AgentHub.
-        const startEvt = requestBegin();
-        queue.push(startEvt);
+        const startEvt = withTraceContext(requestBegin(), attemptTrace);
         await this.write(startEvt);
+        requestBoundaryOpened = true;
+        queue.push(startEvt);
         // Iterate manually to capture the generator's **return value** (LLMOutcome); LLM
         // guarantees it never throws.
-        const gen = this.llm.streamGenerate({
+        modelGenerator = this.llm.streamGenerate({
           newMessages: input,
-          ...(signal ? { signal } : {}),
+          signal: turnAbort.signal,
           ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
         });
         for (;;) {
-          const res = await gen.next();
+          const res = await modelGenerator.next();
           if (res.done) {
-            outcome = res.value;
+            outcome =
+              res.value ??
+              (turnAbort.signal.aborted
+                ? { status: "aborted" }
+                : { status: "failed", errorMessage: "LLM stream ended without an outcome" });
             // Non-completed outcomes carry the failure detail onto the event: a retried
             // request never produces an abort, so this is the only place observability
             // (the errors panel) can learn the real reason (e.g. a quota code). When the
@@ -1037,22 +1409,36 @@ export class ContextEngine {
               this.maxReconnects,
               RETRY_STATUSES,
             );
-            const stopEvt = requestEnd(outcome.status, {
-              ...(outcome.errorMessage !== undefined ? { errorMessage: outcome.errorMessage } : {}),
-              // The authoritative attempt ordinal (1-based, within this retry run); a clean
-              // first-try completion stays unstamped so the common case adds no noise.
-              ...(outcome.status !== "completed" || reconnectsSoFar > 0
-                ? { attempt: reconnectsSoFar + 1 }
-                : {}),
+            await closeAttempt(outcome, {
+              publish: true,
               ...(retryInMs !== undefined ? { retryInMs } : {}),
             });
-            queue.push(stopEvt);
-            await this.write(stopEvt);
+            // retryInMs is present exactly when the outer reconnect loop will keep this logical
+            // Request open for another physical Attempt. Otherwise its model work is terminal,
+            // so close it now — before sibling tools finish — while the enclosing Turn remains
+            // open until runTurn has collected every tool output.
+            if (retryInMs === undefined) {
+              const logicalRequestEnd = spanEnd({
+                kind: "llm.request",
+                traceId: traceContext.traceId,
+                taskId: traceContext.taskId,
+                stepId: traceContext.stepId,
+                spanId: traceContext.requestSpanId,
+                parentSpanId: traceContext.stepId,
+                status: outcome.status,
+                ...(outcome.errorMessage !== undefined
+                  ? { errorMessage: outcome.errorMessage }
+                  : {}),
+              });
+              await this.write(logicalRequestEnd);
+              traceContext.requestClosed = true;
+              queue.push(logicalRequestEnd);
+            }
             break;
           }
-          const msg = res.value;
-          queue.push(msg);
+          const msg = withTraceContext(res.value, attemptTrace);
           await this.write(msg);
+          queue.push(msg);
           // token_usage means "this Request completed normally": record the context usage /
           // Session cumulative counts, and increment the Session turn count (counted per LLM
           // Request, across Tasks; used for compaction threshold checks).
@@ -1083,7 +1469,7 @@ export class ContextEngine {
             toolCalls.push(tc);
             // Already interrupted: stop dispatching new tools, but keep consuming until the LLM
             // returns its outcome (the LLM will close out quickly and return aborted).
-            if (signal?.aborted) continue;
+            if (turnAbort.signal.aborted) continue;
             // The approval callback is injected externally (RunOptions.approve): any throw
             // collapses to deny (conservative), so the exception never escapes the engine —
             // otherwise it would propagate through session.run without building carry-over,
@@ -1096,64 +1482,132 @@ export class ContextEngine {
               process.stderr.write(`[penguin] approve callback threw: ${message}; denying.\n`);
               decision = "deny";
             }
-            if (signal?.aborted) continue;
+            if (turnAbort.signal.aborted) continue;
             // approve is a callback; context_engine emits its decision as an approval_decision
             // OmniMessage: pushed to the stream for frontend rendering, and written to Trace.
-            const decisionMsg = approvalDecision(decision, toolCallId);
-            queue.push(decisionMsg);
+            const decisionMsg = withTraceContext(approvalDecision(decision, toolCallId), {
+              ...attemptTrace,
+              caused_by_event_id: tc.event_id!,
+            });
             await this.write(decisionMsg);
+            queue.push(decisionMsg);
             if (decision !== "allow") {
               // User denied: feed back an aborted output, indicating the tool call was
               // manually canceled.
-              const denied = toolCallOutput({
-                output: "Tool call denied by user.",
-                toolCallId,
-                stopReason: "aborted",
-              });
-              queue.push(denied);
+              const denied = withTraceContext(
+                toolCallOutput({
+                  output: "Tool call denied by user.",
+                  toolCallId,
+                  stopReason: "aborted",
+                }),
+                { ...attemptTrace, caused_by_event_id: tc.event_id! },
+              );
               await this.write(denied);
+              queue.push(denied);
               toolOutputs.push(denied);
               continue;
             }
             // Approved: run concurrently, without blocking further consumption of the LLM
             // stream or approval of the next tool.
+            const toolSpanId = createProtocolId();
+            const toolSpanKind: SpanKind =
+              tc.payload.name === "run_subagent" || tc.payload.name === "input_subagent"
+                ? "subagent.invoke"
+                : "tool.execute";
+            const toolTrace: TraceContext = {
+              trace_id: traceContext.traceId,
+              task_id: traceContext.taskId,
+              step_id: traceContext.stepId,
+              span_id: toolSpanId,
+              parent_span_id: traceContext.stepId,
+              caused_by_event_id: tc.event_id!,
+            };
+            const toolStart = spanBegin({
+              kind: toolSpanKind,
+              traceId: traceContext.traceId,
+              taskId: traceContext.taskId,
+              stepId: traceContext.stepId,
+              spanId: toolSpanId,
+              parentSpanId: traceContext.stepId,
+              causedByEventId: tc.event_id!,
+              attributes: {
+                tool_call_id: toolCallId,
+                tool_name: tc.payload.name,
+              },
+            });
+            await this.write(toolStart);
+            queue.push(toolStart);
             queue.addProducer();
-            void this.executeOne(tc, queue, toolOutputs, signal, approve).finally(() => {
+            const toolRun = this.executeOne(
+              tc,
+              queue,
+              toolOutputs,
+              toolTrace,
+              toolSpanKind,
+              turnAbort.signal,
+              approve,
+            ).finally(() => {
               queue.removeProducer();
             });
+            toolRuns.push(toolRun);
           }
         }
+      } catch (error) {
+        outcome = turnAbort.signal.aborted
+          ? { status: "aborted" }
+          : {
+              status: "failed",
+              errorMessage: error instanceof Error ? error.message : String(error),
+            };
+        await closeAttempt(outcome, { publish: !turnAbort.signal.aborted });
       } finally {
+        driveSettled = true;
         queue.removeProducer();
       }
     })();
 
-    // Single consumer: yield merged messages one at a time until all producers are done and
-    // the queue is drained.
-    for (;;) {
-      const msg = await queue.next();
-      if (msg === null) break;
-      yield msg;
-    }
-    // Wait for the driver task to fully finish (state settles).
-    await drive;
+    let completedNormally = false;
+    try {
+      // Single consumer: yield merged messages one at a time until all producers are done and
+      // the queue is drained.
+      for (;;) {
+        const msg = await queue.next();
+        if (msg === null) break;
+        yield msg;
+      }
+      await drive;
+      await Promise.allSettled(toolRuns);
+      completedNormally = true;
 
-    // Feed into the next turn: reordered to the original tool_call order (each tool_call has
-    // exactly one output, see the executeOne invariant).
-    const byId = new Map<string, OmniMessage>();
-    for (const out of toolOutputs) {
-      const id = (out.payload as { tool_call_id?: string }).tool_call_id;
-      if (id !== undefined) byId.set(id, out);
+      // Feed into the next turn: reordered to the original tool_call order (each tool_call has
+      // exactly one output, see the executeOne invariant).
+      const byId = new Map<string, OmniMessage>();
+      for (const out of toolOutputs) {
+        const id = (out.payload as { tool_call_id?: string }).tool_call_id;
+        if (id !== undefined) byId.set(id, out);
+      }
+      const orderedOutputs: OmniMessage[] = [];
+      const seen = new Set<string>();
+      for (const id of callOrder) {
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const out = byId.get(id);
+        if (out) orderedOutputs.push(out);
+      }
+      return { toolOutputs: orderedOutputs, toolCalls, assistantSegments, outcome };
+    } finally {
+      if (!completedNormally) abortTurn();
+      const modelReturn =
+        !driveSettled && modelGenerator
+          ? modelGenerator.return({ status: "aborted" }).catch(() => undefined)
+          : Promise.resolve(undefined);
+      await Promise.allSettled([drive, modelReturn, ...toolRuns]);
+      if (!completedNormally) {
+        outcome = { status: "aborted" };
+        await closeAttempt(outcome, { publish: false });
+      }
+      signal?.removeEventListener("abort", abortTurn);
     }
-    const orderedOutputs: OmniMessage[] = [];
-    const seen = new Set<string>();
-    for (const id of callOrder) {
-      if (seen.has(id)) continue; // Dedupe: feed back exactly one output per tool_call_id, to preserve pairing
-      seen.add(id);
-      const out = byId.get(id);
-      if (out) orderedOutputs.push(out);
-    }
-    return { toolOutputs: orderedOutputs, toolCalls, assistantSegments, outcome };
   }
 
   /**
@@ -1174,10 +1628,14 @@ export class ContextEngine {
     toolCall: OmniMessage<ToolCallPayload>,
     queue: MergeQueue,
     toolOutputs: OmniMessage[],
+    traceContext: TraceContext,
+    spanKind: "tool.execute" | "subagent.invoke",
     signal?: AbortSignal,
     approve?: ApproveFn,
   ): Promise<void> {
     let completed = false;
+    let status: StopReason = "failed";
+    let errorMessage: string | undefined;
     try {
       for await (const out of this.deps.environment.executeTool({
         toolCall,
@@ -1186,7 +1644,6 @@ export class ContextEngine {
         // Session inherits the parent Agent's approval mode.
         ...(approve ? { approve } : {}),
       })) {
-        queue.push(out);
         // Nested-session messages carrying an origin: forwarded to the frontend as a stream;
         // their content is not written to the parent Trace (the child Session has its own
         // Trace). When a direct child session's (origin length 1) session_meta arrives, write a
@@ -1196,32 +1653,80 @@ export class ContextEngine {
         // Never fed back — a child session's tool_call_output has no pairing with the parent's
         // tool_call, and feeding it back by mistake would be rejected by the Provider.
         if (out.origin && out.origin.length > 0) {
+          // The child Session already owns this message's Trace context. Forward it unchanged;
+          // overwriting it with the parent tool Span would collapse the child graph into its
+          // caller and make the child Trace disagree with the live stream.
+          queue.push(out);
           if (isSessionMeta(out) && out.origin.length === 1) {
-            await this.write(subagentEvent(out.origin[0]!));
+            await this.write(withTraceContext(subagentEvent(out.origin[0]!), traceContext));
+          }
+          if (
+            out.origin.length === 1 &&
+            isEventMessage(out) &&
+            out.payload.type === "trace_begin" &&
+            out.trace?.trace_id
+          ) {
+            await this.write(
+              withTraceContext(
+                subagentEvent(out.origin[0]!, {
+                  traceId: out.trace.trace_id,
+                  ...(out.trace.task_id !== undefined ? { taskId: out.trace.task_id } : {}),
+                }),
+                traceContext,
+              ),
+            );
           }
           continue;
         }
-        await this.write(out);
-        if (isCompleteModelMessage(out) && out.payload.type === "tool_call_output") {
-          toolOutputs.push(out);
+        const tracedOut = withTraceContext(out, traceContext);
+        await this.write(tracedOut);
+        queue.push(tracedOut);
+        if (isCompleteModelMessage(tracedOut) && tracedOut.payload.type === "tool_call_output") {
+          toolOutputs.push(tracedOut);
+          status = tracedOut.payload.stop_reason ?? "completed";
           completed = true;
         }
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      errorMessage = message;
       if (completed) {
         // Thrown only after the complete output was ready: pairing is intact, so just warn.
         process.stderr.write(`[penguin] environment threw after tool output: ${message}\n`);
-        return;
+      } else {
+        const interrupted = signal?.aborted === true;
+        const failed = withTraceContext(
+          toolCallOutput({
+            output: interrupted ? "Tool call aborted." : `[tool error] ${message}`,
+            toolCallId: toolCall.payload.tool_call_id,
+            stopReason: interrupted ? "aborted" : "failed",
+          }),
+          traceContext,
+        );
+        await this.write(failed);
+        queue.push(failed);
+        toolOutputs.push(failed);
+        status = interrupted ? "aborted" : "failed";
       }
-      const failed = toolCallOutput({
-        output: `[tool error] ${message}`,
-        toolCallId: toolCall.payload.tool_call_id,
-        stopReason: "failed",
+    } finally {
+      if (!completed && signal?.aborted) status = "aborted";
+      const end = spanEnd({
+        kind: spanKind,
+        traceId: traceContext.trace_id,
+        ...(traceContext.task_id !== undefined ? { taskId: traceContext.task_id } : {}),
+        ...(traceContext.step_id !== undefined ? { stepId: traceContext.step_id } : {}),
+        spanId: traceContext.span_id!,
+        ...(traceContext.parent_span_id !== undefined
+          ? { parentSpanId: traceContext.parent_span_id }
+          : {}),
+        ...(traceContext.caused_by_event_id !== undefined
+          ? { causedByEventId: traceContext.caused_by_event_id }
+          : {}),
+        status,
+        ...(errorMessage !== undefined ? { errorMessage } : {}),
       });
-      queue.push(failed);
-      await this.write(failed);
-      toolOutputs.push(failed);
+      await this.write(end);
+      queue.push(end);
     }
   }
 
@@ -1235,12 +1740,12 @@ export class ContextEngine {
       partialText("stop", "", "failed"),
     ];
     for (const partial of partials) {
-      yield partial;
       await this.write(partial);
+      yield partial;
     }
     const note = assistantText(text, "failed");
-    yield note;
     await this.write(note);
+    yield note;
   }
 
   // -------------------------------------------------------------------------
@@ -1285,8 +1790,9 @@ export class ContextEngine {
    */
   private async *discardContext(reason: CompactionReason): AsyncGenerator<OmniMessage> {
     yield* this.emitCompactionBegin(reason, "discard");
-    yield* this.emitCompactionEnd(reason, "discard", "completed");
-    await this.startNewContext();
+    yield* this.emitCompactionEnd(reason, "discard", "completed", undefined, () =>
+      this.startNewContext(),
+    );
   }
 
   /**
@@ -1399,8 +1905,14 @@ export class ContextEngine {
         const summaryText = extractSummary(attempt.text);
         if (summaryText !== "" && attempt.toolCalls.length === 0) {
           const summary = userText(buildContextSummaryText(summaryText));
-          yield* this.emitCompactionEnd(reason, "summarize", "completed", { attempt: attempts });
-          await this.startNewContext();
+          const durable = yield* this.emitCompactionEnd(
+            reason,
+            "summarize",
+            "completed",
+            { attempt: attempts },
+            () => this.startNewContext(),
+          );
+          if (!durable) return { status: "failed", committed };
           return { status: "completed", summary, committed };
         }
         // Not a summary — one more failed attempt, sharing the reconnect budget below. Tool
@@ -1651,8 +2163,8 @@ export class ContextEngine {
       context: this.lastRequestTotal,
       turns: this.sessionTurns,
     });
-    yield msg;
     await this.write(msg);
+    yield msg;
   }
 
   /** Yields and records a compaction stop event (carrying the result status — non-completed means compaction was abandoned — plus its share of the RetryDetail block: final attempt ordinal, and the last error detail on failures). */
@@ -1661,17 +2173,108 @@ export class ContextEngine {
     mode: CompactionMode,
     status: StopReason,
     detail?: { attempt?: number; errorMessage?: string },
-  ): AsyncGenerator<OmniMessage> {
+    onPersisted?: () => Promise<void>,
+  ): AsyncGenerator<OmniMessage, boolean> {
     const msg = compactionEnd({ reason, mode, status, ...detail });
+    const durable = !this.deps.trace || (await this.write(msg));
+    if (status === "completed" && !durable) {
+      const failed = compactionEnd({
+        reason,
+        mode,
+        status: "failed",
+        ...detail,
+        errorMessage: "completed compaction could not be persisted",
+      });
+      await this.write(failed);
+      yield failed;
+      return false;
+    }
+    await onPersisted?.();
     yield msg;
+    return durable;
+  }
+
+  /** Emits and records one immutable Span start record. */
+  private async *emitTraceSpanBegin(
+    args: {
+      kind: SpanKind;
+      traceId: string;
+      taskId: string;
+      stepId: string;
+      spanId: string;
+      parentSpanId?: string;
+      attributes?: Record<string, unknown>;
+    },
+    onPersisted?: () => void,
+  ): AsyncGenerator<OmniMessage> {
+    const msg = spanBegin(args);
     await this.write(msg);
+    onPersisted?.();
+    yield msg;
+  }
+
+  /** Emits and records one immutable Span terminal record. */
+  private async *emitTraceSpanEnd(args: {
+    kind: SpanKind;
+    traceId: string;
+    taskId: string;
+    stepId: string;
+    spanId: string;
+    parentSpanId?: string;
+    status: StopReason;
+    errorMessage?: string;
+  }): AsyncGenerator<OmniMessage> {
+    const msg = spanEnd(args);
+    await this.write(msg);
+    yield msg;
+  }
+
+  /** Closes the logical LLM Request before its ReAct Turn root on every terminal path. */
+  private async *emitTraceTurnEnd(
+    context: StepTraceContext,
+    detail: {
+      requestStatus: StopReason;
+      turnStatus: StopReason;
+      errorMessage?: string;
+    },
+  ): AsyncGenerator<OmniMessage> {
+    if (context.requestOpened && !context.requestClosed) {
+      const requestTerminal = spanEnd({
+        kind: "llm.request",
+        traceId: context.traceId,
+        taskId: context.taskId,
+        stepId: context.stepId,
+        spanId: context.requestSpanId,
+        parentSpanId: context.stepId,
+        status: detail.requestStatus,
+        ...(detail.errorMessage !== undefined ? { errorMessage: detail.errorMessage } : {}),
+      });
+      await this.write(requestTerminal);
+      context.requestClosed = true;
+      yield requestTerminal;
+    }
+    if (!context.stepClosed) {
+      const stepTerminal = spanEnd({
+        kind: "agent.step",
+        traceId: context.traceId,
+        taskId: context.taskId,
+        stepId: context.stepId,
+        spanId: context.stepId,
+        parentSpanId: context.taskId,
+        status: detail.turnStatus,
+        ...(detail.errorMessage !== undefined ? { errorMessage: detail.errorMessage } : {}),
+      });
+      await this.write(stepTerminal);
+      context.stepClosed = true;
+      yield stepTerminal;
+    }
   }
 
   /** Interruption: emits an abort event. Cleanup/resending is managed centrally by `run` via carry-over; the LLM history is never touched again. */
   private async *emitAbort(reason: string): AsyncGenerator<OmniMessage> {
     const msg = abortEvent(reason);
-    yield msg;
     await this.write(msg);
+    yield msg;
   }
 
   /**
@@ -1801,24 +2404,59 @@ export class ContextEngine {
    * loop, so write failures only warn rather than throw. The first write after compaction first
    * performs the deferred Trace rotation: splitting the file and opening it with session_meta.
    */
-  private async write(msg: OmniMessage): Promise<void> {
-    if (!this.deps.trace) return;
-    if (this.pendingTraceRotation) {
+  private contextualize(msg: OmniMessage): OmniMessage {
+    if (msg.trace || (msg.origin && msg.origin.length > 0) || isSessionMeta(msg)) return msg;
+    if (isEventMessage(msg) && msg.payload.type === "tool_list_ready") return msg;
+    const scope = this.activeTraceScope;
+    if (!scope) return msg;
+    return withTraceContext(msg, { trace_id: scope.traceId, task_id: scope.taskId });
+  }
+
+  private inputAudit(messages: OmniMessage[], traceId: string): Record<string, unknown> {
+    const inputEventIds: string[] = [];
+    const inputSnapshot: OmniMessage[] = [];
+    for (const message of messages) {
+      if (message.event_id && this.persistedEventTraces.get(message.event_id) === traceId) {
+        inputEventIds.push(message.event_id);
+      } else {
+        inputSnapshot.push(message);
+      }
+    }
+    return {
+      input_event_ids: inputEventIds,
+      ...(inputSnapshot.length > 0 ? { input_snapshot: inputSnapshot } : {}),
+    };
+  }
+
+  private async write(msg: OmniMessage): Promise<boolean> {
+    if (!this.deps.trace) return false;
+    const scoped = this.contextualize(msg);
+    const terminalLifecycle =
+      isEventMessage(scoped) &&
+      (scoped.payload.type === "span_end" || scoped.payload.type === "trace_end");
+    if (this.pendingTraceRotation && !terminalLifecycle) {
       this.pendingTraceRotation = false;
       try {
-        if (this.deps.trace.rotate) await this.deps.trace.rotate();
-        if (this.deps.sessionMeta) await this.deps.trace.write(this.deps.sessionMeta);
-        if (this.deps.toolList) await this.deps.trace.write(this.deps.toolList);
+        const rotated = this.deps.trace.rotate ? await this.deps.trace.rotate() : undefined;
+        if (rotated !== false) {
+          if (this.deps.sessionMeta) await this.deps.trace.write(this.deps.sessionMeta);
+          if (this.deps.toolList) await this.deps.trace.write(this.deps.toolList);
+        }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         process.stderr.write(`[trace] rotate failed: ${message}\n`);
       }
     }
     try {
-      await this.deps.trace.write(msg);
+      await this.deps.trace.write(scoped);
+      if (scoped.event_id && scoped.trace?.trace_id) {
+        this.persistedEventTraces.set(scoped.event_id, scoped.trace.trace_id);
+      }
+      return true;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       process.stderr.write(`[trace] write failed: ${message}\n`);
+      return false;
     }
   }
 }

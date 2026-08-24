@@ -16,6 +16,7 @@ import {
   emptyTokenCounts,
   imageUrlMessage,
   isCompleteModelMessage,
+  isSessionMeta,
   partialText,
   partialToolCallOutput,
   sessionMeta,
@@ -23,12 +24,20 @@ import {
   toolCall,
   toolCallOutput,
   tokenUsage,
+  traceBegin,
   userText,
   withOrigin,
+  withTraceContext,
 } from "../src/omnimessage/index.js";
 import { BUILTIN_TOOL_FACTORIES } from "../src/environment/tools/registry.js";
 import type { GenerativeModelParameters, LLMInterface, LLMOutcome } from "../src/interfaces.js";
-import type { OmniMessage, TextPayload, ToolCallPayload } from "../src/omnimessage/index.js";
+import type {
+  OmniMessage,
+  SpanBeginPayload,
+  SpanEndPayload,
+  TextPayload,
+  ToolCallPayload,
+} from "../src/omnimessage/index.js";
 import { Environment } from "../src/environment/index.js";
 import { Writer, readTrace } from "../src/trace/index.js";
 import { ContextEngine, reconnectDelayMs } from "../src/engine/context-engine.js";
@@ -103,6 +112,26 @@ function execCommandToolConfig() {
 const isToolCall = (m: OmniMessage): boolean =>
   isCompleteModelMessage(m) && m.payload.type === "tool_call";
 
+const isSpanBegin = (m: OmniMessage): m is OmniMessage<SpanBeginPayload> =>
+  m.type === "event_msg" && (m.payload as { type?: string }).type === "span_begin";
+
+const isSpanEnd = (m: OmniMessage): m is OmniMessage<SpanEndPayload> =>
+  m.type === "event_msg" && (m.payload as { type?: string }).type === "span_end";
+
+function expectAllStartedSpansClosed(messages: OmniMessage[]): void {
+  const begins = messages.filter(isSpanBegin);
+  const ends = messages.filter(isSpanEnd);
+  for (const begin of begins) {
+    expect(
+      ends.filter(
+        (end) =>
+          end.trace?.span_id === begin.trace?.span_id &&
+          end.payload.span_kind === begin.payload.span_kind,
+      ),
+    ).toHaveLength(1);
+  }
+}
+
 /** Count of text messages in the list starting with `[turn_aborted]` (flatten carry-over count). */
 const turnAbortedCount = (msgs: OmniMessage[]): number =>
   msgs.filter((m) => ((m.payload as { text?: string }).text ?? "").startsWith("[turn_aborted]"))
@@ -173,6 +202,310 @@ describe("ContextEngine ReAct loop (mock LLM, approve callback)", () => {
     await rm(traces, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
+  it("persists Task/root terminals when the consumer cancels at the first live event", async () => {
+    const recorded: OmniMessage[] = [];
+    const llm: LLMInterface = {
+      async *streamGenerate() {
+        yield assistantText("unreached");
+        return { status: "completed" };
+      },
+    };
+    const environment = new Environment({
+      workspaceDir: workspace,
+      toolConfig: execCommandToolConfig(),
+    });
+    const engine = new ContextEngine({
+      llm,
+      environment,
+      trace: { write: async (message) => void recorded.push(message) },
+    });
+    const generator = engine.run([userText("cancel immediately")], { approve: allowAll });
+
+    expect((await generator.next()).value?.payload).toMatchObject({ type: "trace_begin" });
+    await generator.return(undefined);
+
+    const types = recorded.map((message) => (message.payload as { type?: string }).type);
+    expect(types).toEqual(["trace_begin", "text", "span_begin", "span_end", "trace_end"]);
+    const taskEnd = recorded.find(
+      (message) => isSpanEnd(message) && message.payload.span_kind === "agent.task",
+    ) as OmniMessage<SpanEndPayload>;
+    expect(taskEnd.payload.status).toBe("aborted");
+    expect((recorded.at(-1)!.payload as { status?: string }).status).toBe("aborted");
+    expect((engine as unknown as { taskRunning: boolean }).taskRunning).toBe(false);
+  });
+
+  it("closes Step before Task/root when the consumer cancels at the Step begin", async () => {
+    const recorded: OmniMessage[] = [];
+    let llmCalled = false;
+    const llm: LLMInterface = {
+      async *streamGenerate() {
+        llmCalled = true;
+        return { status: "completed" };
+      },
+    };
+    const environment = new Environment({
+      workspaceDir: workspace,
+      toolConfig: execCommandToolConfig(),
+    });
+    const engine = new ContextEngine({
+      llm,
+      environment,
+      trace: { write: async (message) => void recorded.push(message) },
+    });
+    const generator = engine.run([userText("cancel at step")], { approve: allowAll });
+
+    for (;;) {
+      const next = await generator.next();
+      expect(next.done).toBe(false);
+      if (isSpanBegin(next.value!) && next.value.payload.span_kind === "agent.step") {
+        break;
+      }
+    }
+    await generator.return(undefined);
+
+    expect(llmCalled).toBe(false);
+    expectAllStartedSpansClosed(recorded);
+    expect(
+      recorded.filter(
+        (message) => isSpanBegin(message) && message.payload.span_kind === "llm.request",
+      ),
+    ).toHaveLength(0);
+    const stepEnd = recorded.findIndex(
+      (message) => isSpanEnd(message) && message.payload.span_kind === "agent.step",
+    );
+    const taskEnd = recorded.findIndex(
+      (message) => isSpanEnd(message) && message.payload.span_kind === "agent.task",
+    );
+    expect(stepEnd).toBeLessThan(taskEnd);
+    expect((recorded.at(-1)!.payload as { type?: string }).type).toBe("trace_end");
+  });
+
+  it("aborts and settles the active Attempt before closing Request, Step, Task, and Trace", async () => {
+    const recorded: OmniMessage[] = [];
+    let modelSettled = false;
+    const llm: LLMInterface = {
+      async *streamGenerate({ signal }) {
+        try {
+          await new Promise<void>((resolve) => {
+            if (signal?.aborted) resolve();
+            else signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+          return { status: "aborted" };
+        } finally {
+          modelSettled = true;
+        }
+      },
+    };
+    const environment = new Environment({
+      workspaceDir: workspace,
+      toolConfig: execCommandToolConfig(),
+    });
+    const engine = new ContextEngine({
+      llm,
+      environment,
+      trace: { write: async (message) => void recorded.push(message) },
+    });
+    const generator = engine.run([userText("cancel at attempt")], { approve: allowAll });
+
+    for (;;) {
+      const next = await generator.next();
+      expect(next.done).toBe(false);
+      if (isSpanBegin(next.value!) && next.value.payload.span_kind === "llm.attempt") {
+        break;
+      }
+    }
+    await generator.return(undefined);
+
+    expect(modelSettled).toBe(true);
+    expectAllStartedSpansClosed(recorded);
+    const terminalIndex = (kind: string): number =>
+      recorded.findIndex((message) => isSpanEnd(message) && message.payload.span_kind === kind);
+    expect(terminalIndex("llm.attempt")).toBeLessThan(terminalIndex("llm.request"));
+    expect(terminalIndex("llm.request")).toBeLessThan(terminalIndex("agent.step"));
+    expect(terminalIndex("agent.step")).toBeLessThan(terminalIndex("agent.task"));
+    expect((recorded.at(-1)!.payload as { type?: string }).type).toBe("trace_end");
+  });
+
+  it("settles an in-flight model stream before Trace ends when cancelled after a model chunk", async () => {
+    const recorded: OmniMessage[] = [];
+    let modelSettled = false;
+    const llm: LLMInterface = {
+      async *streamGenerate({ signal }) {
+        try {
+          yield assistantText("first chunk");
+          await new Promise<void>((resolve) => {
+            if (signal?.aborted) resolve();
+            else signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+          return { status: "aborted" };
+        } finally {
+          modelSettled = true;
+        }
+      },
+    };
+    const environment = new Environment({
+      workspaceDir: workspace,
+      toolConfig: execCommandToolConfig(),
+    });
+    const engine = new ContextEngine({
+      llm,
+      environment,
+      trace: { write: async (message) => void recorded.push(message) },
+    });
+    const generator = engine.run([userText("cancel after chunk")], { approve: allowAll });
+
+    for (;;) {
+      const next = await generator.next();
+      expect(next.done).toBe(false);
+      if (
+        isCompleteModelMessage(next.value!) &&
+        next.value.payload.type === "text" &&
+        next.value.payload.text === "first chunk"
+      ) {
+        break;
+      }
+    }
+    await generator.return(undefined);
+
+    expect(modelSettled).toBe(true);
+    expectAllStartedSpansClosed(recorded);
+    const traceEndIndex = recorded.findIndex(
+      (message) => (message.payload as { type?: string }).type === "trace_end",
+    );
+    expect(traceEndIndex).toBe(recorded.length - 1);
+    const lengthAtReturn = recorded.length;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(recorded).toHaveLength(lengthAtReturn);
+  });
+
+  it("aborts and awaits an in-flight tool before Step/Task/Trace terminals", async () => {
+    const recorded: OmniMessage[] = [];
+    let toolSettled = false;
+    let ticks = 0;
+    let markToolStarted!: () => void;
+    const toolStarted = new Promise<void>((resolve) => {
+      markToolStarted = resolve;
+    });
+    const llm: LLMInterface = {
+      async *streamGenerate() {
+        yield toolCall({
+          name: "slow_tool",
+          arguments: "{}",
+          toolCallId: "cancel-tool",
+          stopReason: "completed",
+        });
+        return { status: "completed" };
+      },
+    };
+    const environment: EnvironmentInterface = {
+      async listTools() {
+        return [];
+      },
+      async *executeTool({ toolCall: called, signal }) {
+        const timer = setInterval(() => {
+          ticks += 1;
+        }, 1);
+        markToolStarted();
+        try {
+          await new Promise<void>((resolve) => {
+            if (signal?.aborted) resolve();
+            else signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+          yield toolCallOutput({
+            output: "cancelled",
+            toolCallId: called.payload.tool_call_id,
+            stopReason: "aborted",
+          });
+        } finally {
+          clearInterval(timer);
+          toolSettled = true;
+        }
+      },
+      toolPermission() {
+        return "rw";
+      },
+    };
+    const engine = new ContextEngine({
+      llm,
+      environment,
+      trace: { write: async (message) => void recorded.push(message) },
+    });
+    const generator = engine.run([userText("run slow tool")], { approve: allowAll });
+
+    for (;;) {
+      const next = await generator.next();
+      expect(next.done).toBe(false);
+      if (isSpanBegin(next.value!) && next.value.payload.span_kind === "tool.execute") {
+        break;
+      }
+    }
+    await toolStarted;
+    await generator.return(undefined);
+
+    expect(toolSettled).toBe(true);
+    expectAllStartedSpansClosed(recorded);
+    const toolEnd = recorded.findIndex(
+      (message) => isSpanEnd(message) && message.payload.span_kind === "tool.execute",
+    );
+    const stepEnd = recorded.findIndex(
+      (message) => isSpanEnd(message) && message.payload.span_kind === "agent.step",
+    );
+    expect(toolEnd).toBeLessThan(stepEnd);
+    expect((recorded.at(-1)!.payload as { type?: string }).type).toBe("trace_end");
+    const ticksAtReturn = ticks;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(ticks).toBe(ticksAtReturn);
+    expect(recorded.at(-1)!.payload).toMatchObject({ type: "trace_end", status: "aborted" });
+  });
+
+  it("rejects a concurrent direct operation without changing the active Trace scope", async () => {
+    const recorded: OmniMessage[] = [];
+    let calls = 0;
+    const llm: LLMInterface = {
+      async *streamGenerate({ signal }) {
+        calls += 1;
+        if (calls === 1) {
+          await new Promise<void>((resolve) => {
+            if (signal?.aborted) resolve();
+            else signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+          return { status: "aborted" };
+        }
+        yield assistantText("after release");
+        return { status: "completed" };
+      },
+    };
+    const environment = new Environment({
+      workspaceDir: workspace,
+      toolConfig: execCommandToolConfig(),
+    });
+    const engine = new ContextEngine({
+      llm,
+      environment,
+      trace: { write: async (message) => void recorded.push(message) },
+    });
+    const first = engine.run([userText("first")], { approve: allowAll });
+    for (;;) {
+      const next = await first.next();
+      if (isSpanBegin(next.value!) && next.value.payload.span_kind === "llm.attempt") break;
+    }
+    const activeTraceId = recorded.find(
+      (message) => isSpanBegin(message) && message.payload.span_kind === "agent.task",
+    )?.trace?.trace_id;
+    const countBeforeConflict = recorded.length;
+
+    const conflicting = engine.run([userText("conflict")], { approve: allowAll });
+    await expect(conflicting.next()).rejects.toThrow(/ContextEngine is busy/);
+    expect(recorded).toHaveLength(countBeforeConflict);
+    expect(new Set(recorded.map((message) => message.trace?.trace_id).filter(Boolean))).toEqual(
+      new Set([activeTraceId]),
+    );
+
+    await first.return(undefined);
+    await collectRun(engine, [userText("after")], allowAll);
+    expect(calls).toBe(2);
+  });
+
   it("approves a tool call, writes the file, returns the final answer, traces it", async () => {
     const llm = new FakeLLM();
     const environment = new Environment({
@@ -182,11 +515,8 @@ describe("ContextEngine ReAct loop (mock LLM, approve callback)", () => {
     const trace = new Writer({ tracesDir: traces, sessionId: "sess_test" });
     const engine = new ContextEngine({ llm, environment, trace });
 
-    const collected = await collectRun(
-      engine,
-      [userText("Create hello.txt saying Hello, Penguin")],
-      allowAll,
-    );
+    const prompt = userText("Create hello.txt saying Hello, Penguin");
+    const collected = await collectRun(engine, [prompt], allowAll);
 
     expect(llm.calls).toBe(2);
     expect(
@@ -213,6 +543,80 @@ describe("ContextEngine ReAct loop (mock LLM, approve callback)", () => {
     expect(recordedTypes).toContain("tool_call");
     expect(recordedTypes).toContain("tool_call_output");
     expect(recordedTypes.some((t) => t?.startsWith("partial_"))).toBe(false);
+
+    // Every persisted v3 record has one stable identity, and lifecycle messages keep that same
+    // identity between the live stream and JSONL.
+    expect(recorded.every((message) => message.protocol_version === 3 && !!message.event_id)).toBe(
+      true,
+    );
+    expect(new Set(recorded.map((message) => message.event_id)).size).toBe(recorded.length);
+    const liveSpanEventIds = collected
+      .filter((message) => isSpanBegin(message) || isSpanEnd(message))
+      .map((message) => message.event_id);
+    const recordedSpanEventIds = recorded
+      .filter((message) => isSpanBegin(message) || isSpanEnd(message))
+      .map((message) => message.event_id);
+    expect(recordedSpanEventIds).toEqual(liveSpanEventIds);
+
+    const begins = recorded.filter(isSpanBegin);
+    const ends = recorded.filter(isSpanEnd);
+    expect(begins.filter((message) => message.payload.span_kind === "agent.task")).toHaveLength(1);
+    expect(begins.filter((message) => message.payload.span_kind === "agent.step")).toHaveLength(2);
+    expect(begins.filter((message) => message.payload.span_kind === "llm.request")).toHaveLength(2);
+    expect(begins.filter((message) => message.payload.span_kind === "llm.attempt")).toHaveLength(2);
+    expect(begins.filter((message) => message.payload.span_kind === "tool.execute")).toHaveLength(
+      1,
+    );
+
+    const task = begins.find((message) => message.payload.span_kind === "agent.task")!;
+    const firstTurn = begins.find((message) => message.payload.span_kind === "agent.step")!;
+    const firstRequest = begins.find(
+      (message) =>
+        message.payload.span_kind === "llm.request" &&
+        message.trace?.parent_span_id === firstTurn.trace?.span_id,
+    )!;
+    const firstAttempt = begins.find(
+      (message) =>
+        message.payload.span_kind === "llm.attempt" &&
+        message.trace?.parent_span_id === firstRequest.trace?.span_id,
+    )!;
+    const toolSpan = begins.find((message) => message.payload.span_kind === "tool.execute")!;
+    expect(firstTurn.trace?.span_id).toBe(firstTurn.trace?.step_id);
+    expect(firstTurn.trace?.parent_span_id).toBe(task.trace?.span_id);
+    expect(task.payload.attributes?.input_event_ids).toEqual([prompt.event_id]);
+    expect(recorded.some((message) => message.event_id === prompt.event_id)).toBe(true);
+    expect(firstTurn.payload.attributes?.input_event_ids).toEqual([prompt.event_id]);
+    expect(firstRequest.payload.attributes?.input_event_ids).toEqual([prompt.event_id]);
+    expect(firstAttempt.payload.attributes).toMatchObject({
+      input_event_ids: [prompt.event_id],
+      attempt: 1,
+    });
+    expect(firstAttempt.payload.capabilities).toMatchObject({ repeatable: true, skippable: false });
+    expect(toolSpan.trace?.parent_span_id).toBe(firstTurn.trace?.span_id);
+    expect(toolSpan.payload.attributes).toMatchObject({
+      tool_call_id: "call_1",
+      tool_name: "exec_command",
+    });
+
+    const tracedToolCall = recorded.find(
+      (message) => isCompleteModelMessage(message) && message.payload.type === "tool_call",
+    )!;
+    const tracedToolOutput = recorded.find(
+      (message) => isCompleteModelMessage(message) && message.payload.type === "tool_call_output",
+    )!;
+    expect(tracedToolCall.trace?.span_id).toBe(firstAttempt.trace?.span_id);
+    expect(toolSpan.trace?.caused_by_event_id).toBe(tracedToolCall.event_id);
+    expect(tracedToolOutput.trace?.span_id).toBe(toolSpan.trace?.span_id);
+
+    for (const begin of begins) {
+      expect(
+        ends.some(
+          (end) =>
+            end.trace?.span_id === begin.trace?.span_id &&
+            end.payload.span_kind === begin.payload.span_kind,
+        ),
+      ).toBe(true);
+    }
   });
 
   it("lets the next Agent turn recover truncated text, keeps UI == Agent output, and preserves it after Task end", async () => {
@@ -377,6 +781,37 @@ describe("ContextEngine ReAct loop (mock LLM, approve callback)", () => {
       expect(elapsed).toBeLessThan(TOOL_LATENCY_MS + EPSILON_MS);
       // And no engine-armed wall-clock wait rode along.
       expect(timersArmed).toBe(0);
+
+      // The logical LLM Request does not absorb its sibling tool's latency. Its final Attempt
+      // closes the Request first; the Turn remains open until the slow tool settles.
+      const toolBegin = collected.find(
+        (message) => isSpanBegin(message) && message.payload.span_kind === "tool.execute",
+      )! as OmniMessage<SpanBeginPayload>;
+      const stepId = toolBegin.trace!.step_id;
+      const requestEndIndex = collected.findIndex(
+        (message) =>
+          isSpanEnd(message) &&
+          message.payload.span_kind === "llm.request" &&
+          message.trace?.step_id === stepId,
+      );
+      const toolEndIndex = collected.findIndex(
+        (message) =>
+          isSpanEnd(message) &&
+          message.payload.span_kind === "tool.execute" &&
+          message.trace?.span_id === toolBegin.trace?.span_id,
+      );
+      const turnEndIndex = collected.findIndex(
+        (message) =>
+          isSpanEnd(message) &&
+          message.payload.span_kind === "agent.step" &&
+          message.trace?.step_id === stepId,
+      );
+      expect(requestEndIndex).toBeGreaterThanOrEqual(0);
+      expect(requestEndIndex).toBeLessThan(toolEndIndex);
+      expect(toolEndIndex).toBeLessThan(turnEndIndex);
+      expect(Date.parse(collected[requestEndIndex]!.timestamp)).toBeLessThanOrEqual(
+        Date.parse(collected[toolEndIndex]!.timestamp),
+      );
     } finally {
       timeoutSpy.mockRestore();
       intervalSpy.mockRestore();
@@ -867,7 +1302,7 @@ describe("ContextEngine ReAct loop (mock LLM, approve callback)", () => {
       async *streamGenerate() {
         llmCalls += 1;
         if (llmCalls === 1) {
-          yield toolCall({ name: "spawn", arguments: "{}", toolCallId: "tc-spawn" });
+          yield toolCall({ name: "run_subagent", arguments: "{}", toolCallId: "tc-spawn" });
           yield tokenUsage(emptyTokenCounts(), {
             cache_read: 0,
             cache_write: 0,
@@ -897,7 +1332,19 @@ describe("ContextEngine ReAct loop (mock LLM, approve callback)", () => {
       listTools: async () => [],
       toolPermission: () => undefined,
       async *executeTool(request) {
-        yield withOrigin(childMeta("sess-child"), "sess-child");
+        yield withOrigin(
+          withTraceContext(childMeta("sess-child"), {
+            trace_id: "child-trace",
+            task_id: "child-task",
+            step_id: "child-step",
+            span_id: "child-session-span",
+          }),
+          "sess-child",
+        );
+        yield withOrigin(
+          traceBegin({ rootKind: "task", traceId: "child-trace", taskId: "child-task" }),
+          "sess-child",
+        );
         yield withOrigin(assistantText("from child"), "sess-child");
         yield withOrigin(withOrigin(childMeta("sess-grand"), "sess-grand"), "sess-child");
         yield toolCallOutput({
@@ -908,16 +1355,39 @@ describe("ContextEngine ReAct loop (mock LLM, approve callback)", () => {
     };
     const trace = new Writer({ tracesDir: traces, sessionId: "sess_subagent_ptr" });
     const engine = new ContextEngine({ llm, environment, trace });
-    await collectRun(engine, [userText("go")], allowAll);
+    const collected = await collectRun(engine, [userText("go")], allowAll);
 
     const rows = await readTrace(trace.currentPath());
-    // A direct child session's (origin length 1) session_meta -> exactly one subagent pointer
-    // event (recording only the Session id); a grandchild session's (origin length 2) does not
-    // get a pointer, since its own child Trace records it.
+    // The early session-only pointer is refined once the direct child root begins. A grandchild
+    // (origin length 2) does not get a parent pointer; its child Trace owns that relationship.
     const pointers = rows.filter((m) => (m.payload as { type?: string }).type === "subagent");
-    expect(pointers).toHaveLength(1);
+    expect(pointers).toHaveLength(2);
     expect(pointers[0]!.type).toBe("event_msg");
     expect((pointers[0]!.payload as { session_id?: string }).session_id).toBe("sess-child");
+    expect(pointers[1]!.payload).toMatchObject({
+      session_id: "sess-child",
+      trace_id: "child-trace",
+      task_id: "child-task",
+    });
+    const invokeSpan = rows.find(
+      (message) => isSpanBegin(message) && message.payload.span_kind === "subagent.invoke",
+    );
+    expect(invokeSpan).toBeDefined();
+    expect(pointers[0]!.trace?.span_id).toBe(invokeSpan!.trace?.span_id);
+    expect(pointers[1]!.trace?.span_id).toBe(invokeSpan!.trace?.span_id);
+    const proposal = rows.find(
+      (message) => isCompleteModelMessage(message) && message.payload.type === "tool_call",
+    );
+    expect(invokeSpan!.trace?.caused_by_event_id).toBe(proposal?.event_id);
+    const forwardedChildMeta = collected.find(
+      (message) => isSessionMeta(message) && message.origin?.[0] === "sess-child",
+    );
+    expect(forwardedChildMeta?.trace).toEqual({
+      trace_id: "child-trace",
+      task_id: "child-task",
+      step_id: "child-step",
+      span_id: "child-session-span",
+    });
     // Origin-tagged child session messages (session_meta and body alike) are never written
     // to the parent Trace.
     expect(rows.some((m) => m.origin !== undefined)).toBe(false);
@@ -1475,6 +1945,11 @@ describe("ContextEngine abort during execution", () => {
 
     expect(elapsed).toBeLessThan(3000); // Did not wait the full 5s.
     expect(all.map((m) => (m.payload as { type?: string }).type)).toContain("abort");
+    expectAllStartedSpansClosed(all);
+    const turnEnd = all
+      .filter(isSpanEnd)
+      .find((message) => message.payload.span_kind === "agent.step");
+    expect(turnEnd?.payload.status).toBe("aborted");
 
     // Case A: model output has completed -> the interrupted tool's result is backfilled as a
     // structured tool_call_output, pairing with the already-committed tool_call.
@@ -1627,6 +2102,31 @@ describe("ContextEngine LLM timeout / network interruption (PRN-012)", () => {
       ),
     ).toBe(true);
     expect(all.map((m) => (m.payload as { type?: string }).type)).not.toContain("abort");
+
+    const begins = all.filter(isSpanBegin);
+    const ends = all.filter(isSpanEnd);
+    const turns = begins.filter((message) => message.payload.span_kind === "agent.step");
+    const requests = begins.filter((message) => message.payload.span_kind === "llm.request");
+    const attempts = begins.filter((message) => message.payload.span_kind === "llm.attempt");
+    expect(turns).toHaveLength(1);
+    expect(requests).toHaveLength(1);
+    expect(attempts).toHaveLength(2);
+    expect(attempts.map((message) => message.payload.attributes?.attempt)).toEqual([1, 2]);
+    expect(new Set(attempts.map((message) => message.trace?.parent_span_id))).toEqual(
+      new Set([requests[0]!.trace?.span_id]),
+    );
+    expect(
+      attempts.map(
+        (attempt) =>
+          ends.find((end) => end.trace?.span_id === attempt.trace?.span_id)?.payload.status,
+      ),
+    ).toEqual(["timeout", "completed"]);
+    expect(
+      ends.find((end) => end.trace?.span_id === requests[0]!.trace?.span_id)?.payload.status,
+    ).toBe("completed");
+    expect(
+      ends.find((end) => end.trace?.span_id === turns[0]!.trace?.span_id)?.payload.status,
+    ).toBe("completed");
   });
 
   it("skips a malformed (never-committed) tool_call: no dispatch, no paired output", async () => {
@@ -1774,6 +2274,11 @@ describe("ContextEngine LLM timeout / network interruption (PRN-012)", () => {
     const abort = all.find((m) => (m.payload as { type?: string }).type === "abort");
     expect(abort).toBeDefined();
     expect((abort!.payload as { reason?: string }).reason).toContain("reconnect failed");
+    expectAllStartedSpansClosed(all);
+    const turnEnd = all
+      .filter(isSpanEnd)
+      .find((message) => message.payload.span_kind === "agent.step");
+    expect(turnEnd?.payload.status).toBe("timeout");
 
     // carry-over = original input + [turn_retried] (accumulating partial products from both
     // failed attempts): the next run resends it merged with the new input, without producing
@@ -1907,6 +2412,11 @@ describe("ContextEngine LLM timeout / network interruption (PRN-012)", () => {
     const abort = all.find((m) => (m.payload as { type?: string }).type === "abort");
     expect(abort).toBeDefined();
     expect((abort!.payload as { reason?: string }).reason).toContain("llm request error");
+    expectAllStartedSpansClosed(all);
+    expect(
+      all.filter(isSpanEnd).find((message) => message.payload.span_kind === "agent.step")?.payload
+        .status,
+    ).toBe("auth");
   });
 
   it("a permanent failed (fast-mode rejection) stops the run without burning the ladder", async () => {

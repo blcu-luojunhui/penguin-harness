@@ -19,17 +19,28 @@
  */
 import {
   abortEvent,
+  createProtocolId,
+  isCompleteModelMessage,
+  isEventMessage,
   mcpConnectBegin,
   mcpConnectEnd,
   sessionMeta,
+  spanBegin,
+  spanEnd,
   toolListReady,
+  traceBegin,
+  traceEnd,
+  withProtocolIdentity,
+  withTraceContext,
 } from "./omnimessage/index.js";
 import type {
   McpServerConnectResult,
   OmniMessage,
   SessionMetaPayload,
+  StopReason,
   TokenCounts,
   ToolDefinition,
+  TraceStatus,
 } from "./omnimessage/index.js";
 import { imagesToScratchpadPaths } from "./internal/session-support.js";
 import { runGoalLoop } from "./goal/goal-loop.js";
@@ -48,6 +59,7 @@ import type {
   CompactionSettings,
   EngineInitialState,
   RunOptions,
+  TaskTraceScope,
   TraceSink,
 } from "./engine/context-engine.js";
 
@@ -86,7 +98,7 @@ export interface SessionConfig {
   createBareLLM?: () => LLMInterface;
   /** Context compaction settings (defaults are filled in by the composition layer); only takes effect when provided together with `createLLM`. */
   compaction?: CompactionSettings;
-  /** Session resume: `session_meta` is already in the original Trace file, so it isn't written again on the first run (avoids duplication). */
+  /** Session resume: `session_meta` is already in the Session journal, so it is not duplicated. */
   metaAlreadyWritten?: boolean;
   /** Session resume: the engine's initial state derived from Trace replay (carry-over / accumulated stats, etc.). */
   initialEngineState?: EngineInitialState;
@@ -233,6 +245,7 @@ export class Session {
   private titleAssistantText = "";
   /** Material-frozen flag: becomes true once the first Task containing user text finishes; subsequent runs stop accumulating. */
   private titleMaterialFrozen = false;
+  private activeOperation: symbol | null = null;
 
   constructor(config: SessionConfig) {
     this.sessionId = config.meta.session_id;
@@ -257,8 +270,8 @@ export class Session {
       environment: config.environment,
       ...(config.trace ? { trace: config.trace } : {}),
       ...(config.maxTurns !== undefined ? { maxTurns: config.maxTurns } : {}),
-      // Context compaction: new LLM factory + resolved settings + writes session_meta (and
-      // tool_list_ready) at the start of the new Trace file after splitting.
+      // Context compaction: legacy sinks may rotate physical shards; TraceStore keeps one
+      // logical event source and records a context checkpoint instead.
       ...(config.createLLM ? { createLLM: config.createLLM } : {}),
       ...(config.compaction ? { compaction: config.compaction } : {}),
       ...(config.initialEngineState ? { initialState: config.initialEngineState } : {}),
@@ -294,80 +307,206 @@ export class Session {
    * Docs: /docs/goal-mode.
    */
   async *run(newMessages: OmniMessage[], opts?: SessionRunOptions): AsyncGenerator<OmniMessage> {
-    if (opts?.goal) {
-      // Rounds run with the caller's per-call options minus `goal` (each round is a plain Task).
-      const { goal, ...roundOpts } = opts;
-      yield* this.runGoal(newMessages, goal, roundOpts);
-      return;
+    const owner = this.acquireOperation("run");
+    try {
+      if (opts?.goal) {
+        // Rounds run with the caller's per-call options minus `goal` (each round is a plain Task).
+        const { goal, ...roundOpts } = opts;
+        yield* this.runGoal(newMessages, goal, roundOpts);
+        return;
+      }
+      const taskId = createProtocolId();
+      yield* this.runTask(newMessages, opts, { traceId: taskId, taskId }, true);
+    } finally {
+      this.releaseOperation(owner);
     }
-    yield* this.runTask(newMessages, opts);
   }
 
   /** The single-Task path (a goal round runs one of these per round). */
   private async *runTask(
     newMessages: OmniMessage[],
     opts?: RunOptions,
+    scope?: TaskTraceScope,
+    ownsTrace = false,
   ): AsyncGenerator<OmniMessage> {
-    // Folded before Trace and title material, so the path lines are what gets recorded.
+    const taskScope =
+      scope ??
+      (() => {
+        const taskId = createProtocolId();
+        return { traceId: taskId, taskId };
+      })();
+    // Freeze the exact Task input before any lifecycle record: fold unsupported images, stamp
+    // the resulting envelopes, then prepend a prior bootstrap-abort carry. Task audit ids refer
+    // only to these actual model inputs and only after their payloads reached the Trace.
     if (!this.modelHasVision) newMessages = await this.foldImages(newMessages);
-    // A previously aborted bootstrap dropped these before the engine existed: they lead
-    // this run's input (already folded by their own run), so the model finally sees them
-    // and the engine's run-start write persists them.
+    newMessages = newMessages.map((message) =>
+      message.origin && message.origin.length > 0
+        ? withProtocolIdentity(message)
+        : withTraceContext(withProtocolIdentity(message), {
+            trace_id: taskScope.traceId,
+            task_id: taskScope.taskId,
+          }),
+    );
     if (this.carryOverInput.length > 0) {
       newMessages = [...this.carryOverInput, ...newMessages];
       this.carryOverInput = [];
     }
-    const ready = yield* this.ensureReady(opts?.signal);
-    if (!ready) {
-      // Aborted mid-bootstrap: the attempt is cancelled (cancelBootstrap) and the next
-      // run reconnects from scratch. The aborted turn still leaves a Trace — the input,
-      // the aborted connect pair and the abort event — so the analysis page shows the
-      // interruption and a reload (or restart) does not lose the message. The engine
-      // doesn't exist, so the Session writes them itself; inputs already persisted by a
-      // previous aborted attempt are skipped (repeat aborts record each exactly once),
-      // and the next successful run's engine skips re-writing them (carryOverPersisted).
-      for (const m of newMessages) {
-        const serialized = JSON.stringify(m);
-        if (this.carryOverPersisted.includes(serialized)) continue;
-        if (await this.writeTrace(m, "aborted-run input")) {
-          this.carryOverPersisted.push(serialized);
+    await this.ensureMetaWritten();
+    const rootBegin = ownsTrace
+      ? traceBegin({ rootKind: "task", traceId: taskScope.traceId, taskId: taskScope.taskId })
+      : null;
+    if (rootBegin) {
+      await this.writeTrace(rootBegin, "trace_begin");
+    }
+    const persistedInputEventIds = new Set<string>();
+    const persistedInputEnvelopes = new Set<string>();
+    for (const message of newMessages) {
+      const serialized = JSON.stringify(message);
+      const persisted =
+        this.carryOverPersisted.includes(serialized) ||
+        (await this.writeTrace(message, "task input"));
+      if (persisted) persistedInputEnvelopes.add(serialized);
+      if (persisted && message.trace?.trace_id === taskScope.traceId) {
+        if (message.event_id) persistedInputEventIds.add(message.event_id);
+      }
+    }
+    const taskBegin = spanBegin({
+      kind: "agent.task",
+      traceId: taskScope.traceId,
+      taskId: taskScope.taskId,
+      spanId: taskScope.taskId,
+      attributes: {
+        input_event_ids: [...persistedInputEventIds],
+        ...(persistedInputEventIds.size < newMessages.length
+          ? {
+              input_snapshot: newMessages.filter(
+                (message) => !message.event_id || !persistedInputEventIds.has(message.event_id),
+              ),
+            }
+          : {}),
+      },
+    });
+    await this.writeTrace(taskBegin, "agent.task begin");
+
+    let status: StopReason = "completed";
+    let errorMessage: string | undefined;
+    let completedNormally = false;
+    let inputHandedToEngine = false;
+    try {
+      if (rootBegin) yield rootBegin;
+      yield taskBegin;
+      const ready = yield* this.ensureReady(opts?.signal, taskScope);
+      if (!ready) {
+        status = "aborted";
+        // Aborted mid-bootstrap: the attempt is cancelled (cancelBootstrap) and the next
+        // run reconnects from scratch. The aborted turn still leaves a Trace — the input,
+        // the aborted connect pair and the abort event — so the analysis page shows the
+        // interruption and a reload (or restart) does not lose the message. The engine
+        // doesn't exist, so the Session writes them itself; inputs already persisted by a
+        // previous aborted attempt are skipped (repeat aborts record each exactly once),
+        // and the next successful run's engine skips re-writing them (carryOverPersisted).
+        this.carryOverPersisted = newMessages
+          .filter((message) => persistedInputEnvelopes.has(JSON.stringify(message)))
+          .map((message) => JSON.stringify(message));
+        for (const m of this.abortedBootstrapRecords) {
+          await this.writeTrace(m, "aborted bootstrap record");
+        }
+        this.abortedBootstrapRecords = [];
+        // Carry the merged list, so repeated aborts keep accumulating exactly once each.
+        this.carryOverInput = newMessages;
+        completedNormally = true;
+        return;
+      }
+      // Self-captures title material (the title is derived from the first-turn
+      // conversation text): while material isn't frozen yet, collect this call's user text and
+      // the produced model text; freezes once the first Task containing user text finishes, so
+      // the title reflects the start of the conversation.
+      const capture = !this.titleMaterialFrozen;
+      if (capture) {
+        for (const m of newMessages) {
+          this.titleUserText = appendTitleText(
+            this.titleUserText,
+            m,
+            "user",
+            TITLE_USER_MATERIAL_LIMIT,
+          );
         }
       }
-      for (const m of this.abortedBootstrapRecords) {
-        await this.writeTrace(m, "aborted bootstrap record");
+      inputHandedToEngine = true;
+      for await (const msg of this.engine!.run(newMessages, {
+        ...opts,
+        traceScope: taskScope,
+        persistedInputEventIds,
+      })) {
+        if (capture) {
+          this.titleAssistantText = appendTitleText(
+            this.titleAssistantText,
+            msg,
+            "assistant",
+            TITLE_ASSISTANT_MATERIAL_LIMIT,
+          );
+        }
+        if (isEventMessage(msg) && msg.payload.type === "abort" && status === "completed") {
+          status = "aborted";
+        }
+        if (
+          isCompleteModelMessage(msg) &&
+          msg.payload.type === "text" &&
+          msg.payload.role === "assistant" &&
+          msg.payload.stop_reason &&
+          msg.payload.stop_reason !== "completed"
+        ) {
+          status = msg.payload.stop_reason;
+        }
+        if (
+          isEventMessage(msg) &&
+          msg.payload.type === "span_end" &&
+          msg.payload.span_kind === "agent.step" &&
+          msg.payload.status !== "completed"
+        ) {
+          status = msg.payload.status === "skipped" ? "completed" : msg.payload.status;
+          errorMessage = msg.payload.error_message;
+        }
+        yield msg;
       }
-      this.abortedBootstrapRecords = [];
-      // Carry the merged list, so repeated aborts keep accumulating exactly once each.
-      this.carryOverInput = newMessages;
-      return;
-    }
-    // Self-captures title material (the title is derived from the first-turn
-    // conversation text): while material isn't frozen yet, collect this call's user text and
-    // the produced model text; freezes once the first Task containing user text finishes, so
-    // the title reflects the start of the conversation.
-    const capture = !this.titleMaterialFrozen;
-    if (capture) {
-      for (const m of newMessages) {
-        this.titleUserText = appendTitleText(
-          this.titleUserText,
-          m,
-          "user",
-          TITLE_USER_MATERIAL_LIMIT,
-        );
+      if (capture && this.titleUserText.trim()) this.titleMaterialFrozen = true;
+      completedNormally = true;
+    } catch (error) {
+      status = "failed";
+      errorMessage = error instanceof Error ? error.message : String(error);
+      throw error;
+    } finally {
+      if (!completedNormally && status === "completed") status = "aborted";
+      if (!completedNormally && !inputHandedToEngine) {
+        this.carryOverInput = newMessages;
+        this.carryOverPersisted = newMessages
+          .filter((message) => persistedInputEnvelopes.has(JSON.stringify(message)))
+          .map((message) => JSON.stringify(message));
+      }
+      const taskEnd = spanEnd({
+        kind: "agent.task",
+        traceId: taskScope.traceId,
+        taskId: taskScope.taskId,
+        spanId: taskScope.taskId,
+        status,
+        ...(errorMessage !== undefined ? { errorMessage } : {}),
+      });
+      await this.writeTrace(taskEnd, "agent.task end");
+      const rootEnd = ownsTrace
+        ? traceEnd({
+            rootKind: "task",
+            traceId: taskScope.traceId,
+            taskId: taskScope.taskId,
+            status,
+            ...(errorMessage !== undefined ? { errorMessage } : {}),
+          })
+        : null;
+      if (rootEnd) await this.writeTrace(rootEnd, "trace_end");
+      if (completedNormally) {
+        yield taskEnd;
+        if (rootEnd) yield rootEnd;
       }
     }
-    for await (const msg of this.engine!.run(newMessages, opts)) {
-      if (capture) {
-        this.titleAssistantText = appendTitleText(
-          this.titleAssistantText,
-          msg,
-          "assistant",
-          TITLE_ASSISTANT_MATERIAL_LIMIT,
-        );
-      }
-      yield msg;
-    }
-    if (capture && this.titleUserText.trim()) this.titleMaterialFrozen = true;
   }
 
   /**
@@ -395,12 +534,17 @@ export class Session {
    * bootstrap (unreadable resume history, LLM construction) throws to the caller, and a
    * later run retries with a fresh attempt.
    */
-  private async *ensureReady(signal?: AbortSignal): AsyncGenerator<OmniMessage, boolean> {
+  private async *ensureReady(
+    signal: AbortSignal | undefined,
+    scope: TaskTraceScope,
+  ): AsyncGenerator<OmniMessage, boolean> {
     await this.ensureMetaWritten();
     if (this.engine) return true;
+    const scoped = (message: OmniMessage): OmniMessage =>
+      withTraceContext(message, { trace_id: scope.traceId, task_id: scope.taskId });
     const records: OmniMessage[] = [];
     if (this.mcpServers.length > 0) {
-      const begin = mcpConnectBegin(this.mcpServers);
+      const begin = scoped(mcpConnectBegin(this.mcpServers));
       yield begin;
       records.push(begin);
     }
@@ -415,21 +559,23 @@ export class Session {
       // Trace stays chronological: input, pair, abort.
       this.abortedBootstrapRecords = records.length > 0 ? [...records] : [];
       if (this.mcpServers.length > 0) {
-        const end = mcpConnectEnd({ status: "aborted", results: [] });
+        const end = scoped(mcpConnectEnd({ status: "aborted", results: [] }));
         yield end;
         this.abortedBootstrapRecords.push(end);
       }
-      const aborted = abortEvent("user");
+      const aborted = scoped(abortEvent("user"));
       yield aborted;
       this.abortedBootstrapRecords.push(aborted);
       return false;
     }
     const { tools, llm, mcp } = outcome.value;
     if (this.mcpServers.length > 0) {
-      const end = mcpConnectEnd({
-        status: mcp.some((r) => r.status !== "completed") ? "failed" : "completed",
-        results: mcp,
-      });
+      const end = scoped(
+        mcpConnectEnd({
+          status: mcp.some((r) => r.status !== "completed") ? "failed" : "completed",
+          results: mcp,
+        }),
+      );
       yield end;
       records.push(end);
     }
@@ -512,26 +658,48 @@ export class Session {
       texts.push(p.text);
     }
     const text = texts.join("\n").trim();
-    const loop = runGoalLoop(
-      { run: (msgs) => this.runTask(msgs, opts) },
-      {
-        text,
-        goalFilePath: this.goalFile,
-        ...(goal.budget !== undefined ? { budget: goal.budget } : {}),
-        ...(goal.maxRounds !== undefined ? { maxRounds: goal.maxRounds } : {}),
-        ...(opts.signal ? { signal: opts.signal } : {}),
-      },
-    );
-    for await (const msg of loop) {
-      if (goalFinishedOf(msg) && this.trace) {
-        try {
-          await this.trace.write(msg);
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          process.stderr.write(`[trace] goal_finished write failed: ${message}\n`);
+    const traceId = createProtocolId();
+    await this.ensureMetaWritten();
+    const begin = traceBegin({ rootKind: "goal_run", traceId });
+    await this.writeTrace(begin, "goal trace_begin");
+    let status: TraceStatus = "aborted";
+    let errorMessage: string | undefined;
+    let completedNormally = false;
+    try {
+      yield begin;
+      const loop = runGoalLoop(
+        { run: (msgs, scope) => this.runTask(msgs, opts, scope, false) },
+        {
+          text,
+          goalFilePath: this.goalFile,
+          traceId,
+          ...(goal.budget !== undefined ? { budget: goal.budget } : {}),
+          ...(goal.maxRounds !== undefined ? { maxRounds: goal.maxRounds } : {}),
+          ...(opts.signal ? { signal: opts.signal } : {}),
+        },
+      );
+      for await (const msg of loop) {
+        const finished = goalFinishedOf(msg);
+        if (finished) {
+          status = finished.outcome === "complete" ? "completed" : finished.outcome;
+          await this.writeTrace(msg, "goal_finished");
         }
+        yield msg;
       }
-      yield msg;
+      completedNormally = true;
+    } catch (error) {
+      status = "failed";
+      errorMessage = error instanceof Error ? error.message : String(error);
+      throw error;
+    } finally {
+      const end = traceEnd({
+        rootKind: "goal_run",
+        traceId,
+        status,
+        ...(errorMessage !== undefined ? { errorMessage } : {}),
+      });
+      await this.writeTrace(end, "goal trace_end");
+      if (completedNormally) yield end;
     }
   }
 
@@ -584,11 +752,66 @@ export class Session {
    * Docs: /docs/agent-loop § "Compaction".
    */
   async *compact(opts?: { signal?: AbortSignal }): AsyncGenerator<OmniMessage> {
-    // Before the first run there is no context to compact: stay a strict no-op, without
-    // bootstrapping — a session that never ran must not leave trace records (meta /
-    // tool_list_ready) behind, or an untouched session would look resumable.
-    if (!this.engine) return;
-    yield* this.engine.compact(opts);
+    const owner = this.acquireOperation("compact");
+    try {
+      // Before the first run there is no context to compact: stay a strict no-op, without
+      // bootstrapping — a session that never ran must not leave trace records (meta /
+      // tool_list_ready) behind, or an untouched session would look resumable.
+      if (!this.engine || this.engine.compactability() !== "ok") return;
+      const taskId = createProtocolId();
+      const scope = { traceId: taskId, taskId };
+      const begin = traceBegin({ rootKind: "task", traceId: taskId, taskId });
+      const taskBegin = spanBegin({
+        kind: "agent.task",
+        traceId: taskId,
+        taskId,
+        spanId: taskId,
+        attributes: { input_event_ids: [] },
+      });
+      await this.writeTrace(begin, "manual compaction trace_begin");
+      await this.writeTrace(taskBegin, "manual compaction task begin");
+      let status: StopReason = "completed";
+      let completedNormally = false;
+      let compactionTerminalSeen = false;
+      try {
+        yield begin;
+        yield taskBegin;
+        for await (const raw of this.engine.compact({ ...opts, traceScope: scope })) {
+          const msg = raw.trace
+            ? raw
+            : withTraceContext(raw, { trace_id: taskId, task_id: taskId });
+          if (isEventMessage(msg) && msg.payload.type === "compaction_end") {
+            status = msg.payload.status;
+            compactionTerminalSeen = true;
+          }
+          yield msg;
+        }
+        completedNormally = true;
+      } catch (error) {
+        status = "failed";
+        throw error;
+      } finally {
+        if (!completedNormally && !compactionTerminalSeen && status === "completed") {
+          status = "aborted";
+        }
+        const taskEnd = spanEnd({
+          kind: "agent.task",
+          traceId: taskId,
+          taskId,
+          spanId: taskId,
+          status,
+        });
+        const end = traceEnd({ rootKind: "task", traceId: taskId, taskId, status });
+        await this.writeTrace(taskEnd, "manual compaction task end");
+        await this.writeTrace(end, "manual compaction trace_end");
+        if (completedNormally) {
+          yield taskEnd;
+          yield end;
+        }
+      }
+    } finally {
+      this.releaseOperation(owner);
+    }
   }
 
   /**
@@ -601,11 +824,23 @@ export class Session {
     return this.engine?.compactability() ?? "empty";
   }
 
+  private acquireOperation(kind: "run" | "compact"): symbol {
+    if (this.activeOperation) {
+      throw new Error(`Session is busy; cannot start ${kind}`);
+    }
+    const owner = Symbol(kind);
+    this.activeOperation = owner;
+    return owner;
+  }
+
+  private releaseOperation(owner: symbol): void {
+    if (this.activeOperation === owner) this.activeOperation = null;
+  }
+
   /** Writes `session_meta` to the Trace before the first run/compaction; best-effort — failure doesn't interrupt the run. */
   private async ensureMetaWritten(): Promise<void> {
     if (this.metaWritten) return;
-    await this.writeTrace(this.meta, "session_meta");
-    this.metaWritten = true;
+    this.metaWritten = await this.writeTrace(this.meta, "session_meta");
   }
 
   /** Best-effort `session_meta` Trace write (warn-and-continue stance): a failure logs and never interrupts the run. */

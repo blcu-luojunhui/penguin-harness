@@ -18,6 +18,10 @@ description: 给 Agent 一个目标而不是一条消息——系统在同一 Se
 
 在 SDK 中，目标模式是唯一入口 `run` 的一个选项——`session.run(input, { goal: { budget } })`——而不是独立 API：输入文本即目标，轮次在这一次调用内部循环，流的最后一条消息是携带结局的 `goal_finished` 事件。
 
+协议 v3 把整次调用记录为一个 Goal Run 逻辑 Trace；每个实际启动的 round 是其中一个 Task，每个
+Task 再包含自己的 Agent Steps。Goal 可能在首轮前结束，因此零 Task 的 Goal Trace 也是合法状态；
+物理上下文压缩不会产生新的 Goal 或 Task 身份。详见 [Session 与 Trace](/sessions-and-traces)。
+
 ## 控制文件：GOAL.yaml
 
 循环的状态通道是一个文件，位于 `<agent_dir>/scratchpad/<session_id>/GOAL.yaml`（与模型的 `PLAN.md` 约定同级），目标启动时由系统创建：

@@ -163,7 +163,9 @@ export class TraceIndexRepo {
   /** Owning Agent of a Session's Trace within a Project (the subagent-pointer resolver); null when unindexed. */
   findAgentBySession(projectId: string, sessionId: string): string | null {
     const r = this.db
-      .prepare(`SELECT agent_id FROM trace_files WHERE project_id = ? AND session_id = ? LIMIT 1`)
+      .prepare(
+        `SELECT agent_id FROM trace_sessions WHERE project_id = ? AND session_id = ? LIMIT 1`,
+      )
       .get(projectId, sessionId);
     return r ? (r.agent_id as string) : null;
   }

@@ -1,103 +1,103 @@
 ---
 title: Sessions & Traces
-description: The six-level run model, local data directory layout, Trace file design, and Session recovery.
+description: Logical Trace hierarchy, protocol-v3 storage, and checkpoint-based Session recovery.
 ---
 
-All PenguinHarness runtime data lives on the local file system: configuration is editable files, history is append-only Traces. This page defines each level of the run model and explains how the Trace serves as history, recovery source, and statistics source at once.
+PenguinHarness stores runtime data on the local file system. Protocol v3 separates immutable execution facts from recoverable model context: logical Traces explain what ran, while Context checkpoints let a Session continue without turning physical context shards into product identities.
 
 ## Run model
 
-Six levels: Project → Agent → Workspace → Session → Task → Request.
+The execution hierarchy adapts to the run mode:
+
+```text
+Project → Agent → Workspace → Session
+  ├─ Goal Run Trace
+  │    └─ Task × 0..N
+  │         └─ Agent Step × 0..N
+  └─ Standalone Task Trace
+       └─ Agent Step × 0..N
+
+Agent Step → LLM Request × 1 → Attempt × 1..N
+          └→ Tool / Subagent execution × 0..N
+```
 
 | Concept | Definition |
 | --- | --- |
-| Project | Top-level unit organizing Agents; owns the model and credential configuration; in the multi-user Web setup, users and Projects are many-to-many |
-| Agent | The executing subject; has exactly one Agent State (a persistent directory); one Agent can serve many Workspaces |
-| Workspace | The working directory of one run — the only file scope the model sees; an explicit `workspaceDir` must already exist, otherwise a temporary Workspace `workspaces/tmp-<8hex>` is created |
-| Session | A continuous conversation under one (Agent, Workspace); model and Workspace are locked at Session creation; ids look like `session-YYYY-MM-DD-HH-mm-ss-<8hex>` |
-| Task | One execution goal started by one Prompt; consists of one or more consecutive Requests |
-| Request | One LLM API call: context and tool definitions in, streamed output out |
+| Session | A continuous conversation under one Agent and Workspace; model and Workspace are fixed at creation |
+| Logical Trace | One Goal Run or one standalone Task; the stable root shown in the Trace workspace |
+| Task | One complete `runTask`; a Goal Run can contain multiple Tasks |
+| Agent Step | One observe → model decision → tool-result iteration inside a Task |
+| LLM Request | One logical model decision that may retry |
+| Attempt | One physical provider call inside an LLM Request |
 
-See the [Architecture](/architecture) page for how the levels cooperate, and the [Agent Loop](/agent-loop) for how Requests advance within a Task.
+A Goal may stop before starting a Task, and a Task may stop before starting an Agent Step. Empty roots are therefore valid and remain observable.
 
 ## Data layout
 
-The data root is the `PENGUIN_HOME` environment variable, defaulting to `~/.penguin/data`. The layout is defined in one place, `packages/core/src/state/paths.ts`:
+`PENGUIN_HOME` selects the data root and defaults to `~/.penguin/data`. Trace data lives below each Agent:
 
 ```text
-<root>/<project>/
-├── .project_config.toml          # Project-level models & credentials (hidden file, 0600)
-└── agents/
-    └── <agent>/
-        ├── agent_state/              # system_config.yaml, AGENTS.md, .vault.toml,
-        │                             # tools/, skills/, schedule/
-        │   └── memory/               # Memory: user/ plus one directory per Workspace,
-        │                             # each with its own MEMORY.md index
-        ├── traces/
-        │   └── <yyyy-mm-dd>/<sessionId>_<index3>.jsonl
-        ├── scratchpad/               # temp files, one subdirectory per Session id (e.g. pasted images)
-        ├── shared_env/               # shared interpreter/tool environments (virtualenvs, pipx,
-        │                             # caches) the Agent creates on demand — a system prompt
-        │                             # convention, not a path the code creates, so tooling is
-        │                             # installed once for any task; project dependencies stay
-        │                             # in the project
-        ├── workspaces/               # temporary Workspaces (tmp-<8hex>)
-        ├── benchmarks/               # capability Benchmark cases and scores
-        └── snapshots/                # Agent State version snapshots
+<root>/<project>/agents/<agent>/
+├── agent_state/
+├── traces/
+│   └── <sessionId>/
+│       ├── session.jsonl
+│       ├── traces/
+│       │   └── <traceId>/events.jsonl
+│       └── checkpoints/
+│           └── <checkpointId>.json
+├── scratchpad/<sessionId>/
+├── workspaces/
+├── benchmarks/
+└── snapshots/
 ```
 
-See the [Configuration Reference](/configuration) for the fields of each config file.
+Legacy v1/v2 files under `traces/<yyyy-mm-dd>/<sessionId>_<index3>.jsonl` are left untouched. Protocol-v3 recovery and the Goal/Task workspace do not read or infer them.
 
-## Trace design
+## Trace-first storage
 
-A Trace is an append-only JSON Lines file; each line is one OmniMessage envelope (see the [OmniMessage Protocol](/omni-message)). History is only ever appended, never modified in place.
+`events.jsonl` is the execution source of truth for one logical Trace. Each line is one complete protocol-v3 [OmniMessage](/omni-message) with stable `event_id` and `trace.trace_id`. The file is append-only and does not rotate when model context is compacted.
 
-- One Trace file corresponds to one complete model context. When compaction produces a new context segment, the writer rotates to a new file — `_002`, `_003`, … — with an incrementing index.
-- Recorded: `session_meta`, complete `model_msg`, and all `event_msg`.
-- Not recorded: streaming `partial_*` fragments (the producer appends the complete message once the segment ends), and nested messages tagged with `origin` — a subagent's messages go to the child Session's own Trace, while the parent Trace keeps a single `subagent` pointer event at the spawn site recording the child Session id.
-- `request_begin` and `request_end(status)` come in pairs delimiting one Request; replay uses `request_end.status === "completed"` as the commit criterion for that turn.
-- Appends are serialized inside the writer: records from concurrent producers (the model stream, parallel tool executions) land strictly one after another, each as a single uninterrupted line — a multi-megabyte record such as a base64 image Data URL can never be torn apart by a concurrent append, and file rotation never splits a record.
-- Each record is appended with a single `write(2)` (not `fs.appendFile`, which splits payloads larger than 512 KiB into multiple underlying writes), so an abnormal process exit can at most truncate the last record — it can never tear one apart in the middle. Before Session resumption continues an existing file, the writer probes the file tail: if a previous crash left a torn line (no trailing newline), the next record is preceded by a newline, so the torn line never swallows the records appended after it.
+The Session journal contains links rather than duplicate execution history:
 
-See `packages/core/src/trace/writer.ts` for the implementation.
+- `session_fact` stores Session invariants and the resolved tool snapshot;
+- `trace_link` records logical Trace identity, root kind, and first-seen order;
+- `context_checkpoint_link` identifies a Context checkpoint and its last included Event.
 
-The head of a Trace (illustrative; one OmniMessage envelope per line):
+Streaming `partial_*` fragments are not persisted; their complete messages are. Child Agent messages remain in the child Session's Trace. The parent stores an explicit subagent link, including the child logical Trace when it is known.
 
-```jsonl
-{"timestamp":"2026-07-18T03:10:22.531Z","type":"session_meta","payload":{"session_id":"session-2026-07-18-11-10-22-3f8a1c2d","provider":"deepseek","model_id":"deepseek-v4-pro","model_context_window":1000000,"system_prompt":"…","tools":[…],"agent_state":"/home/u/.penguin/data/default_project/agents/default_agent/agent_state","workspace":"/home/u/work"}}
-{"timestamp":"…","type":"event_msg","payload":{"type":"request_begin"}}
-{"timestamp":"…","type":"model_msg","payload":{"type":"text","role":"user","text":"Create hello.txt"}}
-{"timestamp":"…","type":"model_msg","payload":{"type":"tool_call","role":"assistant","name":"exec_command","arguments":"{\"cmd\":\"printf hi > hello.txt\"}","tool_call_id":"call_0"}}
-{"timestamp":"…","type":"event_msg","payload":{"type":"approval_decision","decision":"allow","tool_call_id":"call_0"}}
-{"timestamp":"…","type":"model_msg","payload":{"type":"tool_call_output","role":"user","output":"[no output]","tool_call_id":"call_0"}}
-{"timestamp":"…","type":"event_msg","payload":{"type":"request_end","status":"completed"}}
-{"timestamp":"…","type":"event_msg","payload":{"type":"token_usage","session":{…},"request":{…}}}
-```
-
-When tool output exceeds `maxOutputLength`, Trace records the same bounded head, truncation marker, and absolute Session recovery path seen by Web/CLI and the model; it does not separately duplicate the archived text. The path exposes the host data-root layout but remains valid across Tasks and Session resume because the unredacted recovery file lives in that Session's scratchpad. The existing explicit Session-deletion path removes the scratchpad and recovery file together. Trace replay therefore faithfully restores both what the model saw and a usable pointer for later follow-up.
+Every JSONL append is serialized and written as one record. A resumed writer probes a pre-existing tail and inserts a newline after a crash-torn record, so later valid records remain parseable. Readers retain unknown events, tolerate a truncated final line, and mark missing lifecycle endings as partial instead of inventing terminal state.
 
 ## Session recovery
 
-The Trace is the single source of truth for recovery — there is no separate session database to keep in sync. `resumeSession` works as follows:
+Context checkpoints are immutable snapshots published with an atomic rename. They accelerate recovery but are not execution facts. A checkpoint link uses a controlled filename and an `after_event_id`; absolute or traversing paths are rejected.
 
-1. Locate the highest-index Trace file of the Session;
-2. Read the runtime configuration from its `session_meta` — model, system prompt, Workspace — all immutable for the lifetime of the Session;
-3. Replay the committed history into a fresh LLM context;
-4. Reconstruct the carry-over (undelivered tool outputs, interruption markers) plus turn and Token counters;
-5. Continue appending to the same Trace file.
+`resumeSession` performs the following steps:
 
-Recovery requires that the Workspace and the model still exist. What recovery guarantees is structural legality: only committed turns are replayed, with `tool_call` / `tool_call_output` pairing intact; incomplete model output (thinking, text) is allowed to be lost. A truncated last line left by an abnormal process exit is tolerated and ignored; a malformed line in the middle of a file (e.g. in a file damaged before writer appends were serialized) is skipped with a diagnostic on stderr, and every parseable record is kept. See `packages/core/src/trace/resume.ts`.
+1. open `<sessionId>/session.jsonl` and restore `session_meta`;
+2. try checkpoint links newest first;
+3. load the newest valid checkpoint and replay later Trace events in journal order;
+4. if a checkpoint is missing or invalid, fall back to an earlier one;
+5. if none are usable, replay all protocol-v3 Trace events.
 
-Special case: if the latest Trace file ends with a completed compaction, that context is closed as a whole — resume starts from an empty context; in summarize mode the `[context_summary]` is reconstructed and prepended to the first input after resume (old Traces using the earlier angle-bracket `<summary>` form are still understood).
+Only committed Requests enter recovered provider history. Tool calls and outputs remain structurally paired; an incomplete model response may be discarded. A hard process crash can leave an open Trace or Span, which remains visible as partial. Normal completion, failure, abort, and generator cancellation write explicit terminal lifecycle events.
 
-## Model switch (/model)
+Recovery requires the original Workspace and model configuration. Existing v1/v2 Sessions are not migrated: back up or export data that must remain accessible, then start a new Session after upgrading.
 
-The Web's `/model` command changes models the way the `/agent` handoff does: picking a model stages it in the composer, and sending creates a new Session under the same Agent via the ordinary session-creation API (the chosen model, **the source session's Workspace** — so files stay reachable), and the first message opens with a `[model_switch_from]` source block — the source session id, the absolute path of its latest Trace file, the Workspace, and the previous model pair — followed by whatever the user typed. The history is **not injected** into the new context: some models require thinking payloads and `fidelity` byte-for-byte when history is replayed, which cannot cross models — instead the model reads the source Trace file itself (JSONL, one message envelope per line) when it needs the earlier context. The source session and its Trace are untouched.
+## Context compaction
 
-## Field fidelity
+Compaction changes recoverable Context, not logical Trace identity. Automatic compaction during a Task continues writing to the same `events.jsonl`; a successful `compaction_end` publishes a checkpoint. Logical Trace files therefore remain stable across any number of Context replacements.
 
-Each content message's opaque provider `fidelity` payload (thinking signatures, phase labels, encrypted reasoning, …) is preserved verbatim in the Trace and sent back verbatim — some models require it byte-for-byte on history replay, and any rewriting would break compatibility. This is one reason the Trace stores raw OmniMessage envelopes rather than a post-processed format.
+## Model switch (`/model`)
+
+Switching models creates a new Session in the same Workspace. The first message contains a `[model_switch_from]` block pointing at the source Session Trace bundle directory, not one context shard. History is not injected across providers; the new model can inspect the source bundle when needed. The source Session remains unchanged.
+
+## Field fidelity and large outputs
+
+Opaque provider `fidelity` data—thinking signatures, encrypted reasoning, phase labels, and similar fields—is stored and replayed verbatim. Rewriting it can make a provider reject recovered history.
+
+When tool output exceeds `maxOutputLength`, the Trace records the same bounded head, truncation marker, and Session scratchpad recovery path seen by the model and clients. Explicit Session deletion removes both the Trace bundle and its scratchpad.
 
 ## Observability
 
-Every approval decision (`approval_decision`), abort (`abort`), compaction (`compaction_begin` / `compaction_end`), and `token_usage` lands in the Trace as an event. The Web Trace view and the usage/cost statistics are both derived from this same data — there is no second source of truth; see the [Web App Guide](/web-app). The approval mechanism itself is covered in [Tools & Approval](/tools). Trace files can also be moved across deployments from the Web Traces page: any file can be exported (downloaded verbatim as JSONL) and imported back under an Agent — an import whose session id already exists under that Agent is rejected, so an imported file always becomes index 001 of a new Session.
+The Web Trace workspace reads explicit lifecycle and observation records only. It lists Goal Run and standalone Task roots at Session level, Tasks inside a Goal, and searchable Agent Steps inside a Task. Span records become execution nodes; explicit Observation Events become read-only observation nodes. Free text is never reclassified as planning, verification, or evaluation.

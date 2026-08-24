@@ -34,20 +34,14 @@ import {
 } from "./state/index.js";
 import { GenerativeModel, ToolCallIdAllocator, effectiveMaxContextLength } from "./llm/index.js";
 import { Environment } from "./environment/index.js";
-import {
-  Writer,
-  findLatestTraceFile,
-  latestSessionId as latestTraceSessionId,
-  readTraceTolerant,
-  resumeTrace,
-} from "./trace/index.js";
+import { TraceStore, latestV3SessionId, loadV3Session } from "./trace/index.js";
 import { Session } from "./session.js";
 import {
   createTempWorkspace,
   formatSessionId,
   sessionEnvironment,
 } from "./internal/session-support.js";
-import { compactionEnd, userText, withOrigin } from "./omnimessage/index.js";
+import { compactionEnd, userText, withOrigin, withTraceContext } from "./omnimessage/index.js";
 import type {
   McpServerConnectResult,
   MessageOrigin,
@@ -314,7 +308,7 @@ export class Agent {
       vault,
     });
 
-    const trace = new Writer({
+    const trace = new TraceStore({
       tracesDir: tracesDir(this.state.root, this.state.projectId, this.state.agentId),
       sessionId,
     });
@@ -368,35 +362,54 @@ export class Agent {
   /**
    * Resume an existing Session and continue the conversation.
    *
-   * The resume source is the Session's **latest-index** Trace file: runtime config is
-   * read from its `session_meta` (Model, the original system prompt text, and the
+   * The resume source is the protocol-v3 Session journal, its linked logical Trace events,
+   * and the latest valid context checkpoint. Runtime config is read from `session_meta` (Model, the original system prompt text, and the
    * Workspace all carry over from the original Session and cannot be changed), while
    * tools and Environment are reassembled from the current Agent State. The replayed,
    * already-committed history is injected once via AgentHub's setHistory (used only on
    * resume); any leftover input is rebuilt as carry-over (paired fallback placeholders
    * are synthesized in memory only, never written to the Trace). Messages after resume
-   * continue in the original Trace file (the file follows the context, not the date),
-   * and Token / turn-count stats carry over from their original values.
+   * continue in the same Session bundle, and Token / turn-count stats carry over. Legacy
+   * date/index Trace files are deliberately not read or migrated.
    * Docs: /docs/sessions-and-traces § "Session recovery".
    */
   async resumeSession(opts: ResumeSessionOptions): Promise<Session> {
     const { sessionId } = opts;
     const dir = tracesDir(this.state.root, this.state.projectId, this.state.agentId);
-    const located = await findLatestTraceFile(dir, sessionId);
-    if (!located) {
+    const loaded = await loadV3Session(dir, sessionId);
+    if (!loaded) {
       throw new Error(
-        `Session does not exist: ${sessionId} (no matching Trace file found under ${dir}).`,
+        `Session does not exist in the protocol-v3 Trace store: ${sessionId} (${dir}).`,
       );
     }
-    const resumed = resumeTrace(await readTraceTolerant(located.path));
+    const fatalDiagnostics = loaded.diagnostics.filter(
+      (diagnostic) =>
+        diagnostic.code !== "duplicate_trace_event_link" &&
+        diagnostic.code !== "missing_trace_event_file",
+    );
+    if (fatalDiagnostics.length > 0) {
+      const summary = fatalDiagnostics
+        .slice(0, 3)
+        .map(
+          (diagnostic) =>
+            `${diagnostic.code}:${diagnostic.event_id ?? diagnostic.trace_id ?? "unknown"}`,
+        )
+        .join(", ");
+      throw new Error(
+        `Protocol-v3 Session Trace is partial and cannot be resumed safely: ${summary}`,
+      );
+    }
+    const resumed = loaded.resumed;
     if (!resumed.meta) {
-      throw new Error(`Trace is missing session_meta and cannot be resumed: ${located.path}`);
+      throw new Error(
+        `Session journal is missing session_meta and cannot be resumed: ${loaded.sessionPath}`,
+      );
     }
     const meta = resumed.meta.payload;
     // Model reference is stored as a pair in session_meta; a missing provider means legacy data (no migration since the product hasn't shipped yet).
     if (typeof meta.provider !== "string") {
       throw new Error(
-        `Trace is from legacy data (session_meta is missing provider; the model reference is not split into separate fields): ${located.path}. Delete the data directory and recreate the Session.`,
+        `Session journal is invalid (session_meta is missing provider): ${loaded.sessionPath}.`,
       );
     }
 
@@ -477,12 +490,10 @@ export class Agent {
       return r;
     };
 
-    // Continue writing to the original Trace file (the Trace only records real messages; synthesized paired placeholders are re-emitted in memory alongside carry-over).
-    const trace = new Writer({
+    // Continue appending to the original protocol-v3 Session bundle.
+    const trace = new TraceStore({
       tracesDir: dir,
       sessionId,
-      dateDir: located.dateDir,
-      startIndex: located.index,
     });
 
     // A compaction the user quit out of (a compaction_begin with no end — the process died
@@ -497,7 +508,17 @@ export class Agent {
     // must not block the resume itself.
     if (resumed.danglingCompaction) {
       try {
-        await trace.write(compactionEnd({ ...resumed.danglingCompaction, status: "failed" }));
+        await trace.write(
+          withTraceContext(
+            compactionEnd({
+              reason: resumed.danglingCompaction.reason,
+              mode: resumed.danglingCompaction.mode,
+              status: "failed",
+              errorMessage: `interrupted compaction ${resumed.danglingCompaction.beginEventId}`,
+            }),
+            resumed.danglingCompaction.trace,
+          ),
+        );
       } catch (err) {
         const detail = err instanceof Error ? err.message : String(err);
         process.stderr.write(`[trace] interrupted-compaction closure failed: ${detail}\n`);
@@ -548,7 +569,7 @@ export class Agent {
       ...(this.state.systemConfig.max_turns !== undefined
         ? { maxTurns: this.state.systemConfig.max_turns }
         : {}),
-      // session_meta is already in the original Trace file, so it isn't rewritten; on the first write after a compaction-triggered rotation, the file is split first.
+      // session_meta is already a Session-journal fact and is not duplicated on resume.
       metaAlreadyWritten: true,
       initialEngineState: {
         carryOver: resumed.carryOver,
@@ -556,7 +577,6 @@ export class Agent {
         sessionTurns: resumed.sessionTurns,
         sessionTokens: resumed.sessionTokens,
         lastRequestTotal: resumed.lastRequestTotal,
-        pendingTraceRotation: resumed.contextClosed,
       },
       resumedHistory: resumed.renderMessages,
     });
@@ -564,9 +584,7 @@ export class Agent {
 
   /** Id of the most recent Session under the current Agent (determined by the timestamp in session_id); returns null if there is no Session. */
   async latestSessionId(): Promise<string | null> {
-    return latestTraceSessionId(
-      tracesDir(this.state.root, this.state.projectId, this.state.agentId),
-    );
+    return latestV3SessionId(tracesDir(this.state.root, this.state.projectId, this.state.agentId));
   }
 
   /**

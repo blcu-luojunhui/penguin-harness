@@ -29,6 +29,7 @@ import {
   assistantText,
   compactionBegin,
   compactionEnd,
+  isEventMessage,
   partialText,
   requestBegin,
   requestEnd,
@@ -38,6 +39,7 @@ import {
   toolCall,
   toolCallOutput,
   userText,
+  withTraceContext,
 } from "../src/omnimessage/index.js";
 import type {
   CompactionBeginPayload,
@@ -56,9 +58,10 @@ import type {
 } from "../src/interfaces.js";
 import { ContextEngine, SUMMARY_RETRY_GUIDANCE } from "../src/engine/context-engine.js";
 import type { CompactionSettings } from "../src/engine/context-engine.js";
+import { Session } from "../src/session.js";
 import { GenerativeModel } from "../src/llm/index.js";
 import type { UniConfig, UniEvent, UniMessage } from "@prismshadow/agenthub";
-import { Writer, readTrace, resumeTrace } from "../src/trace/index.js";
+import { loadV3Session, TraceStore, Writer, readTrace, resumeTrace } from "../src/trace/index.js";
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -404,14 +407,16 @@ describe("context compaction", () => {
     expect(await readdir(dirname(oldPath))).toEqual(["sess_lazy_001.jsonl"]);
 
     await collect(engine.run([userText("task 2")], { approve: allowAll }));
-    // Rotation happens only once the next round has a message to write: the new file opens with session_meta, followed by the summary and the new prompt.
+    // Rotation happens only once the next round has a message to write. Lifecycle events may
+    // precede the model inputs, but the summary still precedes the new prompt.
     expect(trace.currentPath()).not.toBe(oldPath);
     const newTrace = await readTrace(trace.currentPath());
     expect(newTrace[0]!.type).toBe("session_meta");
-    expect(
-      ((newTrace[1]!.payload as { text?: string }).text ?? "").startsWith("[context_summary]"),
-    ).toBe(true);
-    expect((newTrace[2]!.payload as { text?: string }).text).toBe("task 2");
+    const texts = newTrace
+      .map((message) => (message.payload as { text?: string }).text)
+      .filter((text): text is string => text !== undefined);
+    expect(texts[0]!.startsWith("[context_summary]")).toBe(true);
+    expect(texts[1]).toBe("task 2");
   });
 
   it("reconnect exhaustion on the compaction request converges to failed", async () => {
@@ -1422,6 +1427,164 @@ describe("context compaction", () => {
     ]);
   });
 
+  it("does not reset the live context when completed compaction_end is not durable", async () => {
+    const llm1 = new ScriptedLLM(
+      [
+        { messages: [assistantText("answer"), usage(150, 150)] },
+        { messages: [assistantText("[summary]must-not-commit[/summary]")] },
+        { messages: [assistantText("still old"), usage(10, 160)] },
+      ],
+      "llm1",
+    );
+    let replacements = 0;
+    const persisted: OmniMessage[] = [];
+    const engine = new ContextEngine({
+      llm: llm1,
+      environment: fakeEnvironment,
+      trace: {
+        write: async (message) => {
+          const payload = message.payload as { type?: string; status?: string };
+          if (payload.type === "compaction_end" && payload.status === "completed") {
+            throw new Error("primary event payload failed");
+          }
+          persisted.push(message);
+        },
+      },
+      compaction: settings(),
+      createLLM: () => {
+        replacements += 1;
+        return new ScriptedLLM([], "replacement");
+      },
+    });
+
+    const first = await collect(engine.run([userText("first")], { approve: allowAll }));
+    expect(compactionEvents(first).at(-1)).toMatchObject({
+      type: "compaction_end",
+      status: "failed",
+      error_message: "completed compaction could not be persisted",
+    });
+    expect(replacements).toBe(0);
+    expect(
+      persisted.some(
+        (message) =>
+          (message.payload as { type?: string; status?: string }).type === "compaction_end" &&
+          (message.payload as { status?: string }).status === "failed",
+      ),
+    ).toBe(true);
+
+    await collect(engine.run([userText("next")], { approve: allowAll }));
+    expect(llm1.calls.at(-1)!.map(textOf)).toEqual(["next"]);
+    expect(replacements).toBe(0);
+  });
+
+  it.each(["summarize", "discard"] as const)(
+    "persists a restartable checkpoint for manual %s compaction",
+    async (mode) => {
+      const sessionId = `session-manual-${mode}`;
+      const llm1 = new ScriptedLLM(
+        [
+          { messages: [assistantText("small"), usage(10, 10)] },
+          ...(mode === "summarize"
+            ? [{ messages: [assistantText("[summary]restart summary[/summary]")] }]
+            : []),
+        ],
+        "llm1",
+      );
+      const store = new TraceStore({ tracesDir: traces, sessionId });
+      const session = new Session({
+        meta: {
+          session_id: sessionId,
+          provider: "custom",
+          model_id: "test-model",
+          model_context_window: 200000,
+          system_prompt: "sp",
+          agent_state: traces,
+          workspace: traces,
+        },
+        bootstrap: async () => ({ tools: [], llm: llm1, mcp: [] }),
+        mcpServers: [],
+        environment: fakeEnvironment,
+        trace: store,
+        createLLM: () => new ScriptedLLM([], "llm2"),
+        compaction: settings({ mode, maxContextLength: 10_000 }),
+        imagesDir: join(traces, "images"),
+        modelHasVision: true,
+      });
+
+      await collect(session.run([userText("before restart")], { approve: allowAll }));
+      const compacted = await collect(session.compact());
+      expect(compactionEvents(compacted).at(-1)).toMatchObject({ status: "completed" });
+
+      const loaded = await loadV3Session(traces, sessionId);
+      expect(loaded).not.toBeNull();
+      expect(
+        loaded!.journal.filter((record) => record.record_type === "context_checkpoint_link"),
+      ).toHaveLength(1);
+      expect(loaded!.resumed.contextClosed).toBe(true);
+      if (mode === "summarize") {
+        expect((loaded!.resumed.pendingSummary?.payload as { text?: string }).text).toContain(
+          "restart summary",
+        );
+      } else {
+        expect(loaded!.resumed.pendingSummary).toBeUndefined();
+      }
+    },
+  );
+
+  it("commits state/checkpoint before yielding manual compaction_end to a cancelling consumer", async () => {
+    const sessionId = "session-manual-return";
+    const llm1 = new ScriptedLLM(
+      [
+        { messages: [assistantText("small"), usage(10, 10)] },
+        { messages: [assistantText("[summary]return-safe[/summary]")] },
+      ],
+      "llm1",
+    );
+    const store = new TraceStore({ tracesDir: traces, sessionId });
+    const session = new Session({
+      meta: {
+        session_id: sessionId,
+        provider: "custom",
+        model_id: "test-model",
+        model_context_window: 200000,
+        system_prompt: "sp",
+        agent_state: traces,
+        workspace: traces,
+      },
+      bootstrap: async () => ({ tools: [], llm: llm1, mcp: [] }),
+      mcpServers: [],
+      environment: fakeEnvironment,
+      trace: store,
+      createLLM: () => new ScriptedLLM([], "llm2"),
+      compaction: settings({ maxContextLength: 10_000 }),
+      imagesDir: join(traces, "images"),
+      modelHasVision: true,
+    });
+    await collect(session.run([userText("before return")], { approve: allowAll }));
+
+    const compacting = session.compact();
+    for (;;) {
+      const next = await compacting.next();
+      expect(next.done).toBe(false);
+      if (isEventMessage(next.value!) && next.value.payload.type === "compaction_end") {
+        expect(next.value.payload.status).toBe("completed");
+        await compacting.return(undefined);
+        break;
+      }
+    }
+
+    const loaded = await loadV3Session(traces, sessionId);
+    expect(loaded?.resumed.contextClosed).toBe(true);
+    expect((loaded?.resumed.pendingSummary?.payload as TextPayload).text).toContain("return-safe");
+    expect(
+      loaded?.journal.filter((record) => record.record_type === "context_checkpoint_link"),
+    ).toHaveLength(1);
+    const manualTraceEnd = [...(loaded?.events ?? [])]
+      .reverse()
+      .find((message) => (message.payload as { type?: string }).type === "trace_end");
+    expect(manualTraceEnd?.payload).toMatchObject({ status: "completed" });
+  });
+
   it("manual compaction that commits nothing restores the prior carry-over verbatim", async () => {
     // The carry seam's binary (PR #87 review): every attempt was a transport failure, so
     // nothing reached AgentHub — the folded carry-over comes back exactly as it was (the very
@@ -1731,6 +1894,10 @@ describe("a compaction the user quit out of (issue #288)", () => {
   it("resumeTrace reports the unmatched compaction_begin, and discards the interrupted draft", () => {
     // The interrupted compaction's half-written summary is never adopted: the replay
     // reconstructs no [context_summary] and the original context stands (best-effort).
+    const begin = withTraceContext(
+      compactionBegin({ reason: "context", mode: "summarize", context: 150, turns: 1 }),
+      { trace_id: "trace-a", task_id: "task-a", step_id: "step-a", span_id: "span-a" },
+    );
     const interrupted = resumeTrace([
       metaMessage,
       userText("q1"),
@@ -1738,12 +1905,17 @@ describe("a compaction the user quit out of (issue #288)", () => {
       assistantText("a1"),
       usage(150, 150),
       requestEnd("completed"),
-      compactionBegin({ reason: "context", mode: "summarize", context: 150, turns: 1 }),
+      begin,
       userText("COMPACT NOW"),
       requestBegin(),
       assistantText("[summary]half-writ"),
     ]);
-    expect(interrupted.danglingCompaction).toEqual({ reason: "context", mode: "summarize" });
+    expect(interrupted.danglingCompaction).toEqual({
+      reason: "context",
+      mode: "summarize",
+      beginEventId: begin.event_id,
+      trace: begin.trace,
+    });
     expect(interrupted.contextClosed).toBe(false);
     expect(interrupted.pendingSummary).toBeUndefined();
     // The compaction Prompt is not conversational input and is not resent as carry-over.
@@ -1755,6 +1927,10 @@ describe("a compaction the user quit out of (issue #288)", () => {
   });
 
   it("resumeTrace reports an unmatched compaction_begin for the resume path to close", () => {
+    const begin = withTraceContext(
+      compactionBegin({ reason: "context", mode: "summarize", context: 150, turns: 1 }),
+      { trace_id: "trace-a", task_id: "task-a", step_id: "step-a", span_id: "span-a" },
+    );
     const dangling = resumeTrace([
       metaMessage,
       userText("q1"),
@@ -1762,11 +1938,16 @@ describe("a compaction the user quit out of (issue #288)", () => {
       assistantText("a1"),
       usage(150, 150),
       requestEnd("completed"),
-      compactionBegin({ reason: "context", mode: "summarize", context: 150, turns: 1 }),
+      begin,
       userText("COMPACT NOW"),
       requestBegin(),
     ]);
-    expect(dangling.danglingCompaction).toEqual({ reason: "context", mode: "summarize" });
+    expect(dangling.danglingCompaction).toEqual({
+      reason: "context",
+      mode: "summarize",
+      beginEventId: begin.event_id,
+      trace: begin.trace,
+    });
 
     // A matched pair reports nothing — no heal write on healthy traces.
     const closed = resumeTrace([

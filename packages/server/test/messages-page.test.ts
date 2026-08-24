@@ -27,13 +27,23 @@ import {
   tokenUsage,
   toolCall,
   toolCallOutput,
+  toolListReady,
+  traceBegin,
+  traceEnd,
   userText,
+  withTraceContext,
 } from "@prismshadow/penguin-core";
 import { buildHandoffMessage } from "@prismshadow/penguin-core/markers";
 import type { OmniMessage, SessionMetaPayload, TokenCounts } from "@prismshadow/penguin-core";
 import { decodeCursor, encodeCursor } from "../src/services/message-window.js";
 import type { TraceService } from "../src/services/trace-service.js";
-import { makeTempRoot, makeTraceHarness, writeTraceFile } from "./helpers.js";
+import {
+  makeTempRoot,
+  makeTraceHarness,
+  writeLogicalTraceEvents,
+  writeLogicalTraceJournal,
+  writeTraceFile,
+} from "./helpers.js";
 
 const P = "project-w";
 const A = "agent-w";
@@ -71,6 +81,54 @@ function turn(mm: number, n: number, sessionTotal: number): OmniMessage[] {
     at(t("03.000"), requestEnd("completed")),
     at(t("03.500"), tokenUsage(counts(sessionTotal), counts(100 + n))),
   ];
+}
+
+function v3Turn(
+  traceId: string,
+  taskId: string,
+  mm: number,
+  n: number,
+  sessionTotal: number,
+): OmniMessage[] {
+  const stamp = (message: OmniMessage): OmniMessage =>
+    withTraceContext(message, { trace_id: traceId, task_id: taskId });
+  return [
+    at(
+      `2026-07-20T10:${String(mm).padStart(2, "0")}:00.000Z`,
+      traceBegin({ rootKind: "task", traceId, taskId }),
+    ),
+    ...turn(mm, n, sessionTotal).map(stamp),
+    at(
+      `2026-07-20T10:${String(mm).padStart(2, "0")}:04.000Z`,
+      traceEnd({ rootKind: "task", traceId, taskId, status: "completed" }),
+    ),
+  ];
+}
+
+function sessionFormat(sessionId: string) {
+  return {
+    record_type: "session_format",
+    protocol_version: 3,
+    format: "penguin.trace.session",
+    format_version: 1,
+    timestamp: "2026-07-20T09:59:57.000Z",
+    session_id: sessionId,
+  };
+}
+
+function traceEventLink(sessionId: string, message: OmniMessage) {
+  const traceId = message.trace?.trace_id;
+  if (traceId === undefined || message.event_id === undefined) {
+    throw new Error("Protocol-v3 history fixtures require trace_id and event_id");
+  }
+  return {
+    record_type: "trace_event_link",
+    protocol_version: 3,
+    timestamp: message.timestamp,
+    session_id: sessionId,
+    trace_id: traceId,
+    event_id: message.event_id,
+  };
 }
 
 const textOf = (m: OmniMessage): string | undefined => (m.payload as { text?: string }).text;
@@ -145,6 +203,409 @@ describe("messages windowed reads", () => {
     // Windows tile the transcript exactly: concatenated they equal the full read.
     const full = await service.readMessages(P, A, S);
     expect([...first.messages, ...mid.messages, ...tail.messages]).toEqual(full);
+  });
+
+  it("v3 full/tail/before follow exact Session-journal order across facts and roots", async () => {
+    const roots = [1, 2, 3].map((n) => ({
+      traceId: `trace-v3-aabb000${n}`,
+      taskId: `task-v3-aabb000${n}`,
+    }));
+    const rootEvents = roots.map((linked, index) =>
+      v3Turn(linked.traceId, linked.taskId, index, index + 1, (index + 1) * 1000),
+    );
+    const metaFact = {
+      record_type: "session_fact",
+      protocol_version: 3,
+      timestamp: "2026-07-20T09:59:58.000Z",
+      message: at("2026-07-20T09:59:58.000Z", sessionMeta(metaPayload())),
+    };
+    const toolFact = {
+      record_type: "session_fact",
+      protocol_version: 3,
+      timestamp: "2026-07-20T10:00:00.500Z",
+      message: at("2026-07-20T10:00:00.500Z", toolListReady([])),
+    };
+    const traceLink = (index: number) => ({
+      record_type: "trace_link",
+      protocol_version: 3,
+      timestamp: rootEvents[index]![0]!.timestamp,
+      session_id: S,
+      trace_id: roots[index]!.traceId,
+      root_kind: "task",
+      task_id: roots[index]!.taskId,
+    });
+    const journal = [
+      sessionFormat(S),
+      metaFact,
+      traceLink(0),
+      traceEventLink(S, rootEvents[0]![0]!),
+      traceEventLink(S, rootEvents[0]![1]!),
+      toolFact,
+      ...rootEvents[0]!.slice(2).map((message) => traceEventLink(S, message)),
+      { record_type: "future_record", protocol_version: 3 },
+      traceLink(1),
+      ...rootEvents[1]!.map((message) => traceEventLink(S, message)),
+      traceLink(2),
+      ...rootEvents[2]!.map((message) => traceEventLink(S, message)),
+    ];
+    await writeLogicalTraceJournal(root, P, A, S, journal);
+    for (let index = 0; index < roots.length; index += 1) {
+      await writeLogicalTraceEvents(root, P, A, S, roots[index]!.traceId, rootEvents[index]!);
+    }
+
+    const fullResult = await service.readMessagesResult(P, A, S);
+    const full = fullResult.messages;
+    expect(fullResult.history).toEqual({
+      protocolVersion: 3,
+      partial: false,
+      diagnostics: [],
+    });
+    expect(full[0]!.type).toBe("session_meta");
+    const q1Index = full.findIndex((message) => textOf(message) === "q1");
+    const toolIndex = full.findIndex(
+      (message) => (message.payload as { type?: string }).type === "tool_list_ready",
+    );
+    const q2Index = full.findIndex((message) => textOf(message) === "q2");
+    expect(q1Index).toBeGreaterThan(0);
+    expect(toolIndex).toBeGreaterThan(q1Index);
+    expect(toolIndex).toBeLessThan(q2Index);
+    expect(userTexts(full)).toEqual(["q1", "q2", "q3"]);
+
+    const eventOrdinal = (message: OmniMessage): number =>
+      journal.findIndex(
+        (record) =>
+          (record as { record_type?: string; event_id?: string }).record_type ===
+            "trace_event_link" && (record as { event_id?: string }).event_id === message.event_id,
+      ) + 1;
+    const q2 = rootEvents[1]!.find((message) => textOf(message) === "q2")!;
+    const q3 = rootEvents[2]!.find((message) => textOf(message) === "q3")!;
+
+    const tail = await service.readMessagesPage(P, A, S, { kind: "tail", limit: 1 });
+    expect(userTexts(tail.messages)).toEqual(["q3"]);
+    expect(tail.prior.turns).toBe(2);
+    expect(tail.history?.partial).toBe(false);
+    expect(decodeCursor(tail.before!)).toEqual({
+      fileIndex: eventOrdinal(q3),
+      ordinal: 0,
+    });
+
+    const middle = await service.readMessagesPage(P, A, S, {
+      kind: "before",
+      cursor: decodeCursor(tail.before!)!,
+      limit: 1,
+    });
+    expect(userTexts(middle.messages)).toEqual(["q2"]);
+    expect(middle.prior.turns).toBe(1);
+    expect(decodeCursor(middle.before!)).toEqual({
+      fileIndex: eventOrdinal(q2),
+      ordinal: 0,
+    });
+
+    const first = await service.readMessagesPage(P, A, S, {
+      kind: "before",
+      cursor: decodeCursor(middle.before!)!,
+      limit: 10,
+    });
+    expect(first.messages[0]!.type).toBe("session_meta");
+    expect(
+      first.messages.some(
+        (message) => (message.payload as { type?: string }).type === "tool_list_ready",
+      ),
+    ).toBe(true);
+    expect(userTexts(first.messages)).toEqual(["q1"]);
+    expect(first.before).toBeUndefined();
+    expect([...first.messages, ...middle.messages, ...tail.messages]).toEqual(full);
+  });
+
+  it("v3 child history expands once for session-only plus refined pointers in full and paged reads", async () => {
+    const parentTrace1 = "trace-v3-parent-aabb0001";
+    const parentTask1 = "task-v3-parent-aabb0001";
+    const parentTrace2 = "trace-v3-parent-aabb0002";
+    const parentTask2 = "task-v3-parent-aabb0002";
+    const childTrace = "trace-v3-child-ccdd0002";
+    const childTask = "task-v3-child-ccdd0002";
+    const sessionFact = (sessionId: string) => ({
+      record_type: "session_fact",
+      protocol_version: 3,
+      timestamp: "2026-07-20T09:59:58.000Z",
+      message: at("2026-07-20T09:59:58.000Z", sessionMeta(metaPayload({ session_id: sessionId }))),
+    });
+    const traceLink = (sessionId: string, traceId: string, taskId: string) => ({
+      record_type: "trace_link",
+      protocol_version: 3,
+      timestamp: "2026-07-20T10:00:00.000Z",
+      session_id: sessionId,
+      trace_id: traceId,
+      root_kind: "task",
+      task_id: taskId,
+    });
+    const parentContext = { trace_id: parentTrace1, task_id: parentTask1 };
+    const invocationContext = {
+      ...parentContext,
+      span_id: "span-v3-child-invoke-ccdd0002",
+    };
+    const parentEvents1 = [
+      at(
+        "2026-07-20T10:00:00.000Z",
+        traceBegin({ rootKind: "task", traceId: parentTrace1, taskId: parentTask1 }),
+      ),
+      withTraceContext(at("2026-07-20T10:00:00.100Z", userText("q1")), parentContext),
+      withTraceContext(at("2026-07-20T10:00:01.000Z", requestBegin()), parentContext),
+      withTraceContext(at("2026-07-20T10:00:02.000Z", subagentEvent(CHILD)), invocationContext),
+      withTraceContext(
+        at(
+          "2026-07-20T10:00:02.100Z",
+          subagentEvent(CHILD, { traceId: childTrace, taskId: childTask }),
+        ),
+        invocationContext,
+      ),
+      withTraceContext(at("2026-07-20T10:00:03.000Z", assistantText("a1")), parentContext),
+      withTraceContext(at("2026-07-20T10:00:04.000Z", requestEnd("completed")), parentContext),
+      withTraceContext(
+        at("2026-07-20T10:00:04.500Z", tokenUsage(counts(1000), counts(100))),
+        parentContext,
+      ),
+      at(
+        "2026-07-20T10:00:05.000Z",
+        traceEnd({
+          rootKind: "task",
+          traceId: parentTrace1,
+          taskId: parentTask1,
+          status: "completed",
+        }),
+      ),
+    ];
+    const parentEvents2 = v3Turn(parentTrace2, parentTask2, 1, 2, 2000);
+    const childEvents = [
+      at(
+        "2026-07-20T10:00:02.200Z",
+        traceBegin({ rootKind: "task", traceId: childTrace, taskId: childTask }),
+      ),
+      withTraceContext(at("2026-07-20T10:00:02.300Z", assistantText("child v3 says")), {
+        trace_id: childTrace,
+        task_id: childTask,
+      }),
+      withTraceContext(at("2026-07-20T10:00:02.400Z", tokenUsage(counts(400), counts(400))), {
+        trace_id: childTrace,
+        task_id: childTask,
+      }),
+      at(
+        "2026-07-20T10:00:02.500Z",
+        traceEnd({
+          rootKind: "task",
+          traceId: childTrace,
+          taskId: childTask,
+          status: "completed",
+        }),
+      ),
+    ];
+    await writeLogicalTraceJournal(root, P, A, S, [
+      sessionFormat(S),
+      sessionFact(S),
+      traceLink(S, parentTrace1, parentTask1),
+      ...parentEvents1.map((message) => traceEventLink(S, message)),
+      traceLink(S, parentTrace2, parentTask2),
+      ...parentEvents2.map((message) => traceEventLink(S, message)),
+    ]);
+    await writeLogicalTraceJournal(root, P, A, CHILD, [
+      sessionFormat(CHILD),
+      sessionFact(CHILD),
+      traceLink(CHILD, childTrace, childTask),
+      ...childEvents.map((message) => traceEventLink(CHILD, message)),
+    ]);
+    await writeLogicalTraceEvents(root, P, A, S, parentTrace1, parentEvents1);
+    await writeLogicalTraceEvents(root, P, A, S, parentTrace2, parentEvents2);
+    await writeLogicalTraceEvents(root, P, A, CHILD, childTrace, childEvents);
+
+    const fullResult = await service.readMessagesResult(P, A, S);
+    const full = fullResult.messages;
+    expect(fullResult.history?.partial).toBe(false);
+    expect(full.filter((message) => textOf(message) === "child v3 says")).toHaveLength(1);
+    expect(
+      full.filter((message) => message.type === "session_meta" && message.origin?.[0] === CHILD),
+    ).toHaveLength(1);
+    expect(full.some((message) => (message.payload as { type?: string }).type === "subagent")).toBe(
+      false,
+    );
+
+    const tail = await service.readMessagesPage(P, A, S, { kind: "tail", limit: 1 });
+    expect(userTexts(tail.messages)).toEqual(["q2"]);
+    expect(tail.messages.some((message) => textOf(message) === "child v3 says")).toBe(false);
+    expect(tail.prior.subagentTokens).toBe(400);
+
+    const older = await service.readMessagesPage(P, A, S, {
+      kind: "before",
+      cursor: decodeCursor(tail.before!)!,
+      limit: 10,
+    });
+    expect(older.messages.filter((message) => textOf(message) === "child v3 says")).toHaveLength(1);
+    expect([...older.messages, ...tail.messages]).toEqual(full);
+  });
+
+  it("rejects pre-marker v3 history instead of guessing cross-file order", async () => {
+    const traceId = "trace-v3-legacy-aabb0001";
+    const taskId = "task-v3-legacy-aabb0001";
+    const events = v3Turn(traceId, taskId, 0, 1, 1000);
+    await writeLogicalTraceJournal(root, P, A, S, [
+      {
+        record_type: "session_fact",
+        protocol_version: 3,
+        timestamp: "2026-07-20T09:59:58.000Z",
+        message: at("2026-07-20T09:59:58.000Z", sessionMeta(metaPayload())),
+      },
+      {
+        record_type: "trace_link",
+        protocol_version: 3,
+        timestamp: events[0]!.timestamp,
+        session_id: S,
+        trace_id: traceId,
+        root_kind: "task",
+        task_id: taskId,
+      },
+    ]);
+    await writeLogicalTraceEvents(root, P, A, S, traceId, events);
+
+    await expect(service.readMessagesResult(P, A, S)).rejects.toMatchObject({
+      status: 409,
+      code: "trace_history_unsupported",
+    });
+    await expect(
+      service.readMessagesPage(P, A, S, { kind: "tail", limit: 1 }),
+    ).rejects.toMatchObject({ status: 409, code: "trace_history_unsupported" });
+    await expect(service.readRoots(P, A, S)).rejects.toMatchObject({
+      status: 409,
+      code: "trace_history_unsupported",
+    });
+    await expect(service.readRoot(P, A, S, traceId)).rejects.toMatchObject({
+      status: 409,
+      code: "trace_history_unsupported",
+    });
+  });
+
+  it("keeps marker-backed history readable while diagnosing link holes and conflicts", async () => {
+    const traceId = "trace-v3-partial-aabb0001";
+    const taskId = "task-v3-partial-aabb0001";
+    const good = at("2026-07-20T10:00:00.000Z", traceBegin({ rootKind: "task", traceId, taskId }));
+    const mismatched = withTraceContext(at("2026-07-20T10:00:01.000Z", userText("wrong Trace")), {
+      trace_id: "trace-v3-other-aabb0002",
+      task_id: taskId,
+    });
+    const unlinked = withTraceContext(at("2026-07-20T10:00:02.000Z", assistantText("unlinked")), {
+      trace_id: traceId,
+      task_id: taskId,
+    });
+    const goodLink = traceEventLink(S, good);
+    await writeLogicalTraceJournal(root, P, A, S, [
+      sessionFormat(S),
+      {
+        record_type: "session_fact",
+        protocol_version: 3,
+        timestamp: "2026-07-20T09:59:58.000Z",
+        message: at("2026-07-20T09:59:58.000Z", sessionMeta(metaPayload())),
+      },
+      {
+        record_type: "trace_link",
+        protocol_version: 3,
+        timestamp: good.timestamp,
+        session_id: S,
+        trace_id: traceId,
+        root_kind: "task",
+        task_id: taskId,
+      },
+      goodLink,
+      goodLink,
+      {
+        record_type: "trace_event_link",
+        protocol_version: 3,
+        timestamp: mismatched.timestamp,
+        session_id: S,
+        trace_id: traceId,
+        event_id: mismatched.event_id,
+      },
+      {
+        record_type: "trace_event_link",
+        protocol_version: 3,
+        timestamp: "2026-07-20T10:00:03.000Z",
+        session_id: S,
+        trace_id: traceId,
+        event_id: "event-v3-missing-aabb0003",
+      },
+    ]);
+    await writeLogicalTraceEvents(root, P, A, S, traceId, [good, mismatched, unlinked]);
+
+    const full = await service.readMessagesResult(P, A, S);
+    expect(full.messages.map((message) => message.type)).toEqual(["session_meta", "event_msg"]);
+    expect(full.history?.partial).toBe(true);
+    expect(full.history?.diagnostics.map((diagnostic) => diagnostic.code)).toEqual([
+      "duplicate_trace_event_link",
+      "trace_event_mismatch",
+      "dangling_trace_event_link",
+      "unlinked_trace_event",
+    ]);
+
+    const page = await service.readMessagesPage(P, A, S, { kind: "tail", limit: 1 });
+    expect(page.messages).toEqual(full.messages);
+    expect(page.history).toEqual(full.history);
+  });
+
+  it("preserves physical journal cursors and root order across a malformed middle line", async () => {
+    const traceId = "trace-v3-malformed-aabb0001";
+    const taskId = "task-v3-malformed-aabb0001";
+    const context = { trace_id: traceId, task_id: taskId };
+    const firstTurn = turn(9, 1, 1000).map((message) => withTraceContext(message, context));
+    const secondTurn = turn(1, 2, 2000).map((message) => withTraceContext(message, context));
+    const journalPath = await writeLogicalTraceJournal(root, P, A, S, [
+      sessionFormat(S),
+      {
+        record_type: "session_fact",
+        protocol_version: 3,
+        timestamp: "2026-07-20T09:59:58.000Z",
+        message: at("2026-07-20T09:59:58.000Z", sessionMeta(metaPayload())),
+      },
+      {
+        record_type: "trace_link",
+        protocol_version: 3,
+        timestamp: firstTurn[0]!.timestamp,
+        session_id: S,
+        trace_id: traceId,
+        root_kind: "task",
+        task_id: taskId,
+      },
+      ...firstTurn.map((message) => traceEventLink(S, message)),
+      ...secondTurn.map((message) => traceEventLink(S, message)),
+    ]);
+    const lines = (await fs.readFile(journalPath, "utf8")).trimEnd().split("\n");
+    lines.splice(8, 0, '{"record_type":"trace_event_link"');
+    await fs.writeFile(journalPath, `${lines.join("\n")}\n`, "utf8");
+    // Payload-file order and timestamps both disagree with the journal links.
+    await writeLogicalTraceEvents(root, P, A, S, traceId, [...secondTurn, ...firstTurn]);
+
+    const full = await service.readMessagesResult(P, A, S);
+    expect(userTexts(full.messages)).toEqual(["q1", "q2"]);
+    expect(full.history?.diagnostics.map((diagnostic) => diagnostic.code)).toEqual([
+      "malformed_session_journal",
+    ]);
+
+    const tail = await service.readMessagesPage(P, A, S, { kind: "tail", limit: 1 });
+    expect(userTexts(tail.messages)).toEqual(["q2"]);
+    expect(decodeCursor(tail.before!)).toEqual({ fileIndex: 10, ordinal: 0 });
+    const older = await service.readMessagesPage(P, A, S, {
+      kind: "before",
+      cursor: decodeCursor(tail.before!)!,
+      limit: 1,
+    });
+    expect(userTexts(older.messages)).toEqual(["q1"]);
+    expect(older.messages[0]!.type).toBe("session_meta");
+    expect([...older.messages, ...tail.messages]).toEqual(full.messages);
+
+    const detail = await service.readRoot(P, A, S, traceId);
+    expect(detail.records.map((record) => record.event_id)).toEqual(
+      [...firstTurn, ...secondTurn].map((record) => record.event_id),
+    );
+    expect(detail.root.partial).toBe(true);
+    expect(detail.diagnostics?.map((diagnostic) => diagnostic.code)).toEqual([
+      "malformed_session_journal",
+    ]);
   });
 
   it("windows span shard boundaries; a mid-Task rotation stays glued to its Task's window", async () => {

@@ -30,7 +30,14 @@
  * the stream — including origin-marked ones from subagent sessions, which are part of the
  * goal's cost — contributes `request.total - request.cache_read`.
  */
-import { goalFinished, isEventMessage, isModelMessage, userText } from "../omnimessage/index.js";
+import {
+  createProtocolId,
+  goalFinished,
+  isEventMessage,
+  isModelMessage,
+  userText,
+  withTraceContext,
+} from "../omnimessage/index.js";
 import type { GoalOutcomeStatus, OmniMessage } from "../omnimessage/index.js";
 import { stripLeadingMarkerBlocks } from "../omnimessage/markers/index.js";
 import { readGoalStatus, writeGoalFile, UNLIMITED_BUDGET } from "./goal-file.js";
@@ -39,7 +46,10 @@ import { goalTokenDelta } from "./goal-stream.js";
 
 /** The slice of Session the loop drives: one Task per round (structural, so tests can substitute a fake). */
 export interface GoalRoundRunner {
-  run(newMessages: OmniMessage[]): AsyncGenerator<OmniMessage>;
+  run(
+    newMessages: OmniMessage[],
+    scope?: { traceId: string; taskId: string },
+  ): AsyncGenerator<OmniMessage>;
 }
 
 export interface GoalLoopOptions {
@@ -61,6 +71,8 @@ export interface GoalLoopOptions {
    */
   maxRounds?: number;
   signal?: AbortSignal;
+  /** Goal Run Trace identity; when present every round receives its own Task identity. */
+  traceId?: string;
 }
 
 /** Default `maxRounds`: the runaway backstop for goals with no (or a huge) budget. */
@@ -105,7 +117,7 @@ export async function* runGoalLoop(
     rounds++;
     roundFailed = false;
     const compose = kind === "regular" ? goalRoundMessage : goalWrapUpMessage;
-    const input = userText(
+    let input = userText(
       compose({
         objective,
         goalFilePath: opts.goalFilePath,
@@ -116,8 +128,12 @@ export async function* runGoalLoop(
         body: rounds === 1 ? opts.text : objective,
       }),
     );
+    const scope = opts.traceId ? { traceId: opts.traceId, taskId: createProtocolId() } : undefined;
+    if (scope) {
+      input = withTraceContext(input, { trace_id: scope.traceId, task_id: scope.taskId });
+    }
     yield input;
-    for await (const msg of session.run([input])) {
+    for await (const msg of session.run([input], scope)) {
       used += goalTokenDelta(msg);
       if (isMainAbort(msg)) aborted = true;
       // The LAST assistant text decides: a mid-round failed notice followed by normal text
@@ -128,7 +144,10 @@ export async function* runGoalLoop(
     }
   }
 
-  const finish = (outcome: GoalOutcomeStatus) => goalFinished(outcome, rounds, used);
+  const finish = (outcome: GoalOutcomeStatus): OmniMessage => {
+    const message = goalFinished(outcome, rounds, used);
+    return opts.traceId ? withTraceContext(message, { trace_id: opts.traceId }) : message;
+  };
 
   // The one and only system write: afterwards the file belongs to the model.
   await writeGoalFile(opts.goalFilePath, { objective, status: "active" });

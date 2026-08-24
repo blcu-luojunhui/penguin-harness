@@ -48,6 +48,7 @@ import type {
   TokenCounts,
   TokenUsagePayload,
   ToolCallPayload,
+  TraceContext,
 } from "../omnimessage/index.js";
 import { buildContextSummaryText, extractSummary } from "../omnimessage/markers/index.js";
 
@@ -85,7 +86,12 @@ export interface ResumeResult {
    * every reader treats messages between the paired events as compaction-internal, so an
    * unclosed span would hide everything appended after it (issue #288).
    */
-  danglingCompaction?: { reason: CompactionReason; mode: CompactionMode };
+  danglingCompaction?: {
+    reason: CompactionReason;
+    mode: CompactionMode;
+    beginEventId: string;
+    trace: TraceContext;
+  };
 }
 
 /** Content of the pairing-backfill placeholder output (the tool hadn't finished and no output was persisted before the process exited). */
@@ -273,13 +279,30 @@ export function resumeTrace(messages: OmniMessage[]): ResumeResult {
   const sessionTokens = lastSessionTokens(messages);
   const lastRequestTotal = lastRequestTotalOf(messages);
 
-  // —— First check the file-level case: compaction closure (the file ends with a completed
-  // compaction stop and no new file was opened, i.e. it's still the latest index at resume time)
-  // — this file's context is fully closed, so the whole file is not replayed.
-  const last = messages[messages.length - 1];
-  if (last && isCompactionEnd(last)) {
-    const p = last.payload;
-    if (p.status === "completed") {
+  // Compaction is a context reset, not a file-tail convention. Find the latest valid completed
+  // reset even when Task/root terminals or a later Step follow it; then replay only its tail.
+  // This same reducer is used for full event replay and checkpoint fallback, so a second
+  // compaction in a checkpoint tail cannot resurrect the older context.
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const boundary = messages[index]!;
+    if (!isCompactionEnd(boundary) || boundary.payload.status !== "completed") continue;
+    const p = boundary.payload;
+    const prefix = messages.slice(0, index + 1);
+    const summaryText =
+      p.mode === "summarize" ? extractSummary(lastCompletedRequestText(prefix)) : "";
+    if (p.mode === "summarize" && summaryText === "") continue;
+
+    const tail = messages.slice(index + 1);
+    const hasContextTail = tail.some(
+      (message) =>
+        isCompleteModelMessage(message) ||
+        isRequestBegin(message) ||
+        isRequestEnd(message) ||
+        (isEventMessage(message) &&
+          (message.payload.type === "compaction_begin" ||
+            message.payload.type === "compaction_end")),
+    );
+    if (!hasContextTail) {
       const result: ResumeResult = {
         history: [],
         carryOver: [],
@@ -291,21 +314,20 @@ export function resumeTrace(messages: OmniMessage[]): ResumeResult {
         meta,
       };
       if (p.mode !== "summarize") return result;
-      // Reconstruct the summary from the compaction request's output (the assistant text of
-      // the last completed Request). Always rebuilt in the current [context_summary] form —
-      // extractSummary itself still accepts the old <summary> tags an old Trace may contain.
-      const summaryText = extractSummary(lastCompletedRequestText(messages));
-      if (summaryText !== "") {
-        result.pendingSummary = userText(buildContextSummaryText(summaryText));
-        return result;
-      }
-      // The compaction output extracts to an **empty** summary: only a pre-#83 engine could
-      // have written such a "completed" closure (compaction now fails instead of committing an
-      // empty summary, which would erase the task state). Mirror the current contract: void
-      // the closure and fall through to turn-by-turn replay — the original context this file
-      // still holds is restored, and the committed compaction turn stays in history like any
-      // committed turn.
+      result.pendingSummary = userText(buildContextSummaryText(summaryText));
+      return result;
     }
+
+    const resumedTail = resumeTrace(meta ? [meta, ...tail] : tail);
+    return {
+      ...resumedTail,
+      sessionTokens,
+      ...(resumedTail.pendingSummary === undefined &&
+      !tail.some(isRequestBegin) &&
+      p.mode === "summarize"
+        ? { pendingSummary: userText(buildContextSummaryText(summaryText)) }
+        : {}),
+    };
   }
 
   // —— Turn-by-turn determination + pending-input convergence.
@@ -319,6 +341,9 @@ export function resumeTrace(messages: OmniMessage[]): ResumeResult {
   /** Whether we're between a matched pair of compaction events: the compaction prompt in this
    * span is not conversational input and must not be resent as-is if uncommitted. */
   let inCompaction = false;
+  let compactionTraceId: string | undefined;
+  let requestInCompaction = false;
+  const compactionInputIds = new Set<string>();
   /** The last compaction_begin still waiting for its end (null once matched): a non-null value at the end of the file is a compaction the user quit out of, closed as failed by the resume path (see ResumeResult.danglingCompaction). */
   let danglingBegin: OmniMessage<CompactionBeginPayload> | null = null;
   /** Ids of tool_calls that are committed (in history) and ids of outputs that are paired (in
@@ -342,11 +367,14 @@ export function resumeTrace(messages: OmniMessage[]): ResumeResult {
     // (thinking/text) is allowed to be lost.
     // Exception: a failed compaction turn's compaction prompt is not conversational input and is
     // not reclaimed (structured output is still reclaimed, subject to eligibility filtering).
-    const keep = inCompaction ? snapshot.filter((m) => toolCallOutputId(m) !== null) : snapshot;
+    const keep = requestInCompaction
+      ? snapshot.filter((m) => toolCallOutputId(m) !== null)
+      : snapshot;
     pending = [...keep, ...pending];
     snapshot = [];
     outputs = [];
     inRequest = false;
+    requestInCompaction = false;
   };
 
   for (const msg of messages) {
@@ -357,6 +385,15 @@ export function resumeTrace(messages: OmniMessage[]): ResumeResult {
       // exit only affects the tail) — treat it as uncommitted.
       if (inRequest) dropUncommittedRound();
       inRequest = true;
+      requestInCompaction =
+        inCompaction &&
+        compactionTraceId !== undefined &&
+        (msg.trace?.trace_id === undefined || msg.trace.trace_id === compactionTraceId);
+      if (!requestInCompaction && compactionInputIds.size > 0) {
+        pending = pending.filter(
+          (message) => !message.event_id || !compactionInputIds.has(message.event_id),
+        );
+      }
       snapshot = pending;
       pending = [];
       continue;
@@ -397,10 +434,11 @@ export function resumeTrace(messages: OmniMessage[]): ResumeResult {
         // committed it — e.g. an invalid-summary attempt of a compaction that then failed),
         // but does not count as a Session turn: in-process only runTurn increments the
         // counter, never runCompactionRequest.
-        if (!inCompaction) sessionTurns += 1;
+        if (!requestInCompaction) sessionTurns += 1;
         snapshot = [];
         outputs = [];
         inRequest = false;
+        requestInCompaction = false;
       } else {
         dropUncommittedRound();
       }
@@ -414,6 +452,14 @@ export function resumeTrace(messages: OmniMessage[]): ResumeResult {
         // All user-side messages go into the pending buffer: ones between begin/end (output from
         // parallel tools completing during the request) count toward the next turn's input.
         pending.push(msg);
+        if (
+          inCompaction &&
+          compactionTraceId !== undefined &&
+          (msg.trace?.trace_id === undefined || msg.trace.trace_id === compactionTraceId) &&
+          msg.event_id
+        ) {
+          compactionInputIds.add(msg.event_id);
+        }
       } else if (inRequest) {
         outputs.push(msg);
       }
@@ -425,10 +471,14 @@ export function resumeTrace(messages: OmniMessage[]): ResumeResult {
       const t = (msg.payload as { type?: string }).type;
       if (t === "compaction_begin") {
         inCompaction = true;
+        compactionTraceId = msg.trace?.trace_id;
         danglingBegin = msg as OmniMessage<CompactionBeginPayload>;
       } else if (t === "compaction_end") {
-        inCompaction = false;
-        danglingBegin = null;
+        if (compactionTraceId === undefined || msg.trace?.trace_id === compactionTraceId) {
+          inCompaction = false;
+          compactionTraceId = undefined;
+          danglingBegin = null;
+        }
       } else if (t === "abort" && (msg.origin?.length ?? 0) === 0) renderMessages.push(msg);
       // Other events (token_usage / approval_decision / tool_list_ready / mcp_connect_*,
       // etc.) don't participate in turn determination and stay out of the render view —
@@ -475,11 +525,13 @@ export function resumeTrace(messages: OmniMessage[]): ResumeResult {
     sessionTurns,
     renderMessages,
     meta,
-    ...(danglingBegin !== null
+    ...(danglingBegin !== null && danglingBegin.event_id && danglingBegin.trace?.trace_id
       ? {
           danglingCompaction: {
             reason: danglingBegin.payload.reason,
             mode: danglingBegin.payload.mode,
+            beginEventId: danglingBegin.event_id!,
+            trace: danglingBegin.trace!,
           },
         }
       : {}),

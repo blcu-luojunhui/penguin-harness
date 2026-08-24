@@ -456,7 +456,7 @@ describe("Session.runGoal input", () => {
 
   // `modelHasVision: true` throughout: the fold runs regardless, and a vision model is the case
   // that would break if runGoal ever grew the `if (!this.modelHasVision)` the other paths have.
-  function makeSession(completeOn = 1): Session {
+  function makeSession(completeOn = 1, recorded?: OmniMessage[]): Session {
     const meta: SessionMetaPayload = {
       session_id: "session-1",
       provider: "custom",
@@ -474,6 +474,9 @@ describe("Session.runGoal input", () => {
       imagesDir: path.join(dir, "scratchpad", "session-1"),
       modelHasVision: true,
       goalFilePath: file,
+      ...(recorded
+        ? { trace: { write: async (message: OmniMessage) => void recorded.push(message) } }
+        : {}),
     });
   }
 
@@ -515,5 +518,90 @@ describe("Session.runGoal input", () => {
     await expect(
       roundInputs(session, [userText("   "), imageUrlMessage(PNG_DATA_URL)]),
     ).rejects.toThrow(/non-empty text objective/);
+  });
+
+  it("uses one Goal Trace with a distinct Task and Step per round", async () => {
+    const recorded: OmniMessage[] = [];
+    const session = makeSession(2, recorded);
+    await roundInputs(session, [userText("finish the goal")]);
+
+    const events = recorded.filter((message) => message.type === "event_msg");
+    const rootBegin = events.find(
+      (message) => (message.payload as { type?: string }).type === "trace_begin",
+    )!;
+    const rootEnd = events.find(
+      (message) => (message.payload as { type?: string }).type === "trace_end",
+    )!;
+    expect(rootBegin.payload).toMatchObject({ root_kind: "goal_run" });
+    expect(rootEnd.payload).toMatchObject({ root_kind: "goal_run", status: "completed" });
+    expect(rootEnd.trace?.trace_id).toBe(rootBegin.trace?.trace_id);
+
+    const taskBegins = events.filter(
+      (message) =>
+        (message.payload as { type?: string; span_kind?: string }).type === "span_begin" &&
+        (message.payload as { span_kind?: string }).span_kind === "agent.task",
+    );
+    const stepBegins = events.filter(
+      (message) =>
+        (message.payload as { type?: string; span_kind?: string }).type === "span_begin" &&
+        (message.payload as { span_kind?: string }).span_kind === "agent.step",
+    );
+    expect(taskBegins).toHaveLength(2);
+    expect(stepBegins).toHaveLength(2);
+    expect(new Set(taskBegins.map((message) => message.trace?.task_id)).size).toBe(2);
+    expect(
+      taskBegins.every((message) => message.trace?.trace_id === rootBegin.trace?.trace_id),
+    ).toBe(true);
+    for (const step of stepBegins) {
+      expect(step.trace?.parent_span_id).toBe(step.trace?.task_id);
+      expect(taskBegins.some((task) => task.trace?.span_id === step.trace?.task_id)).toBe(true);
+    }
+  });
+
+  it("records a pre-aborted Goal as a zero-Task root", async () => {
+    const recorded: OmniMessage[] = [];
+    const session = makeSession(1, recorded);
+    const controller = new AbortController();
+    controller.abort();
+    for await (const _ of session.run([userText("never start a round")], {
+      goal: {},
+      signal: controller.signal,
+    })) {
+      // drain
+    }
+
+    const events = recorded.filter((message) => message.type === "event_msg");
+    expect(
+      events.filter(
+        (message) =>
+          (message.payload as { type?: string; span_kind?: string }).type === "span_begin" &&
+          (message.payload as { span_kind?: string }).span_kind === "agent.task",
+      ),
+    ).toHaveLength(0);
+    expect(
+      events.find((message) => (message.payload as { type?: string }).type === "trace_end")
+        ?.payload,
+    ).toMatchObject({ root_kind: "goal_run", status: "aborted" });
+  });
+
+  it("persists standalone Task/root terminals when its generator is cancelled", async () => {
+    const recorded: OmniMessage[] = [];
+    const session = makeSession(1, recorded);
+    const generator = session.run([userText("cancel before bootstrap")]);
+    expect((await generator.next()).value?.payload).toMatchObject({ type: "trace_begin" });
+    await generator.return(undefined);
+
+    const execution = recorded.filter((message) => message.type === "event_msg");
+    expect(
+      execution.find(
+        (message) =>
+          (message.payload as { type?: string; span_kind?: string }).type === "span_end" &&
+          (message.payload as { span_kind?: string }).span_kind === "agent.task",
+      )?.payload,
+    ).toMatchObject({ status: "aborted" });
+    expect(
+      execution.find((message) => (message.payload as { type?: string }).type === "trace_end")
+        ?.payload,
+    ).toMatchObject({ root_kind: "task", status: "aborted" });
   });
 });

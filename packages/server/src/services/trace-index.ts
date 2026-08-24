@@ -50,6 +50,7 @@ import type { SessionSources } from "../runtime/session-sources.js";
 import { fallbackTitle } from "../runtime/title-generator.js";
 
 const TRACE_FILE_RE = /^(.+)_(\d{3})\.jsonl$/;
+const SESSION_DIR_RE = /^session-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}-[0-9a-f]{8}$/;
 
 /** Absolute path of an indexed shard (reconstructed — rows never store paths; the data root may move). */
 export function traceFilePath(root: string, row: TraceFileRow): string {
@@ -110,6 +111,58 @@ function factsFromRecords(
 interface SeenDirs {
   root: number;
   dates: Map<string, number>;
+  /** Protocol-v3 Session bundle directories seen during the last diff. */
+  v3Sessions: Set<string>;
+}
+
+/** Extracts journal-wrapped Session facts while tolerating torn and unknown JSONL records. */
+function parseV3SessionFacts(content: string): OmniMessage[] {
+  const messages: OmniMessage[] = [];
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const value = JSON.parse(line) as unknown;
+      if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
+      const record = value as Record<string, unknown>;
+      if (
+        record.record_type !== "session_fact" ||
+        record.protocol_version !== 3 ||
+        record.message === null ||
+        typeof record.message !== "object" ||
+        Array.isArray(record.message)
+      ) {
+        continue;
+      }
+      messages.push(record.message as OmniMessage);
+    } catch {
+      // Every journal record is independently useful. A torn tail or malformed middle
+      // record must not hide later valid facts on the next reconciliation pass.
+    }
+  }
+  return messages;
+}
+
+/** A v3 bundle opts in only when its first parseable journal record is its exact marker. */
+function hasV3SessionMarker(content: string, sessionId: string): boolean {
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    let value: unknown;
+    try {
+      value = JSON.parse(line) as unknown;
+    } catch {
+      continue;
+    }
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+    const record = value as Record<string, unknown>;
+    return (
+      record.record_type === "session_format" &&
+      record.protocol_version === 3 &&
+      record.format === "penguin.trace.session" &&
+      record.format_version === 1 &&
+      record.session_id === sessionId
+    );
+  }
+  return false;
 }
 
 export class TraceIndexService {
@@ -172,7 +225,7 @@ export class TraceIndexService {
     if (rootMtime === null) {
       // No traces directory: whatever the index still holds for this Agent is stale.
       this.repo.deleteByAgent(projectId, agentId);
-      this.seen.set(key, { root: -1, dates: new Map() });
+      this.seen.set(key, { root: -1, dates: new Map(), v3Sessions: new Set() });
       return;
     }
     if (!force && cached && cached.root === rootMtime) {
@@ -202,7 +255,11 @@ export class TraceIndexService {
 
     // Change detected / first look / force: diff date dirs (readdir only the changed ones).
     this.counters.dirScans += 1;
-    const next: SeenDirs = { root: cacheable(rootMtime), dates: new Map() };
+    const next: SeenDirs = {
+      root: cacheable(rootMtime),
+      dates: new Map(),
+      v3Sessions: new Set(),
+    };
     const knownByDate = new Map<string, TraceFileRow[]>();
     for (const row of this.repo.listFilesByAgent(projectId, agentId)) {
       const list = knownByDate.get(row.date) ?? [];
@@ -217,11 +274,29 @@ export class TraceIndexService {
       next.dates.set(date, cacheable(m));
       // Unchanged dir already reflected in the gate cache: its rows are current. A fresh
       // mtime is never treated as unchanged (and was cached as a non-matching sentinel).
-      if (!force && cached?.dates.get(date) === m) continue;
+      if (!force && cached?.dates.get(date) === m) {
+        if (cached.v3Sessions.has(date)) next.v3Sessions.add(date);
+        continue;
+      }
+      const children = await listFiles(path.join(dir, date));
+      const v3Journal = children.includes("session.jsonl")
+        ? await this.readMarkedV3SessionJournal(path.join(dir, date), date)
+        : null;
+      if (v3Journal !== null) {
+        next.v3Sessions.add(date);
+        // A directory is either a v3 Session bundle or a legacy date directory. Never
+        // manufacture trace_files rows for the new layout, and clear impossible stale
+        // legacy rows if an on-disk directory changed roles.
+        for (const row of knownByDate.get(date) ?? []) {
+          this.repo.deleteFile(projectId, agentId, row.sessionId, row.fileIndex);
+        }
+        await this.classifyV3Session(projectId, agentId, date, v3Journal);
+        continue;
+      }
       const known = new Map(
         (knownByDate.get(date) ?? []).map((r) => [`${r.sessionId}\0${r.fileIndex}`, r]),
       );
-      for (const file of await listFiles(path.join(dir, date))) {
+      for (const file of children) {
         const match = TRACE_FILE_RE.exec(file);
         if (!match) continue;
         const sessionId = match[1]!;
@@ -251,9 +326,50 @@ export class TraceIndexService {
     // Registration-time classification: ONCE per newly seen Session (bounded head-read
     // of its earliest shard) — listings afterwards never touch file contents.
     for (const sessionId of newSessions) {
-      await this.classifySession(projectId, agentId, sessionId);
+      // During a transition both layouts may exist for one id. The v3 journal is the
+      // resumable Session authority, so legacy facts must not overwrite it.
+      if (!next.v3Sessions.has(sessionId)) {
+        await this.classifySession(projectId, agentId, sessionId);
+      }
+    }
+    // trace_sessions is also a rebuildable cache. Retain a row only while either a
+    // legacy shard or an explicit v3 Session bundle exists for this Agent.
+    const liveSessions = new Set(next.v3Sessions);
+    for (const row of this.repo.listFilesByAgent(projectId, agentId)) {
+      liveSessions.add(row.sessionId);
+    }
+    for (const row of this.repo.listSessionsByAgent(projectId, agentId)) {
+      if (!liveSessions.has(row.sessionId)) this.repo.deleteBySession(row.sessionId);
     }
     this.seen.set(key, next);
+  }
+
+  /** Reads a bundle marker without letting an arbitrary legacy directory change roles. */
+  private async readMarkedV3SessionJournal(
+    sessionDir: string,
+    sessionId: string,
+  ): Promise<string | null> {
+    if (!SESSION_DIR_RE.test(sessionId)) return null;
+    try {
+      const journal = await fs.readFile(path.join(sessionDir, "session.jsonl"), "utf8");
+      return hasV3SessionMarker(journal, sessionId) ? journal : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Reads protocol-v3 journal facts and registers the Session without inventing shard rows. */
+  private async classifyV3Session(
+    projectId: string,
+    agentId: string,
+    sessionId: string,
+    journal: string,
+  ): Promise<void> {
+    this.counters.headReads += 1;
+    const records = parseV3SessionFacts(journal);
+    const facts = factsFromRecords(projectId, agentId, sessionId, records);
+    this.repo.upsertSession(facts);
+    if (facts.metaRead) this.sources?.set(sessionId, facts.source);
   }
 
   /** Head-reads the Session's earliest indexed shard and stores its facts (origin/workspace/title/model ref). */

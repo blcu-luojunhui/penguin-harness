@@ -13,7 +13,7 @@ SDK 的唯一执行入口是 `session.run(newMessages, opts?)`：输入本次新
 session.run(newMessages, { approve, signal })
   │  存在上次中断的补发内容?→ 前置到本轮输入
   ▼
-┌── 轮循环(≤ max_turns,默认 -1 不限制)────────────────────────┐
+┌── Agent Step 循环(≤ max_turns,默认 -1 不限制)──────────────┐
 │                                                               │
 │  request_begin                                                │
 │  LLM.streamGenerate(newMessages)                              │
@@ -24,13 +24,13 @@ session.run(newMessages, { approve, signal })
 │    │          ▼                                               │
 │    │     Environment.executeTool ──► 并发执行,输出流式回传    │
 │    └─ LLMOutcome:                                             │
-│    failed/timeout/malformed ──► 同轮自动重连(≤5 次,          │
+│    failed/timeout/malformed ──► 同 Request 新建 Attempt      │
 │                                 附 [turn_retried],工具不重跑) │
 │  token_usage + request_end(LLM 流结束即产出,不等工具)         │
 │                                                               │
-│  工具输出按原始调用顺序重排 ──► 作为下一轮输入                 │
-│  本轮无 tool_call?──► Task 结束,run 返回                      │
-│  压缩触发(context/turns)?──► summarize/discard + Trace 轮转  │
+│  工具输出按原始调用顺序重排 ──► 作为下一 Step 输入            │
+│  本 Step 无 tool_call?──► Task 结束,run 返回                 │
+│  压缩触发(context/turns)?──► summarize/discard + checkpoint │
 └───────────────────────────────────────────────────────────────┘
 
 signal 中断(任意时刻)──► 产出 abort 事件 + 构造补发内容 ──► run 返回
@@ -60,18 +60,24 @@ interface RunOptions {
 }
 ```
 
-## 一轮(Turn)的生命周期
+## Agent Step 生命周期
 
-Task 由若干连续的 Request(轮)组成，每轮：
+Task 由若干连续的 Agent Step 组成。每个 Step 是显式的 `agent.step` Span，内部包含一个逻辑
+`llm.request` Span；自动重连会在该 Request 下创建多个独立的 `llm.attempt` 子 Span。既有的
+`request_begin` / `request_end` 仍用于判定已提交的 Provider history。每个 Step：
 
-1. 产出 `request_begin`;
+1. 打开 `agent.step`、`llm.request` 与首个 `llm.attempt`，再产出 `request_begin`；
 2. LLM 流式返回：`partial_*` 分片与完整消息依次产出；
 3. 每个完整的 `tool_call` 恰好触发一次 `approve` 回调，决策以 `approval_decision` 事件记录；
-4. 通过审批的工具交给 Environment **并发执行**(审批本身逐个进行)，输出按完成顺序流出；
-5. LLM 流结束时，先产出其最后一条 `token_usage`，随即产出 `request_end(status)`——**不等待工具**，仍在执行的工具输出可出现在 `request_end` 之后；
-6. 整批工具全部到达终态后，工具结果**按原始调用顺序**重排，作为下一轮输入——在此之前不会发起下一次 Request。
+4. 通过审批的工具作为 Step 下同级的 `tool.execute`（或 `subagent.invoke`）Span 交给 Environment **并发执行**；审批本身仍逐个进行，输出按完成顺序流出；
+5. LLM 流结束时，依次产出最后一条 `token_usage`、`request_end(status)` 和 `llm.attempt` 结束事件——**不等待工具**，仍在执行的工具 Span 可以更晚结束；
+6. 可重试失败会在同一逻辑 Request 下打开新的 `llm.attempt`；否则逻辑 Request 随最终 Attempt 闭合，Step 继续等待整批工具收敛；
+7. 工具结果按**原始调用顺序**重排后，Step 闭合；这些结果成为下一 Step 的输入，在整批工具终态之前不会打开下一 Step。
 
-某轮不再产生 `tool_call` 时，Task 结束。拒绝(deny)会生成一条合成的 `aborted` 工具输出(内容为 `Tool call denied by user.`)，模型据此继续。
+完整模型消息与显式语义观察通过 OmniMessage Trace Context 归属到对应 Attempt 或 Tool Span。
+工具 Span 使用 `caused_by_event_id` 回指 `tool_call` 提议，渲染器无需再依据时间戳或文本推断因果边。
+某个 Step 不再产生 `tool_call` 时，Task 结束。拒绝(deny)会生成一条合成的 `aborted` 工具输出(内容为
+`Tool call denied by user.`)，模型据此继续。
 
 ## 中断与补发(carry-over)
 
@@ -123,9 +129,9 @@ interface CompactionSettings {
 | `turns` | Session 轮数 ≥ `maxSessionTurns`(默认 -1，即不限) |
 | `manual` | 用户执行 `/compact` 或调用 `session.compact()` |
 
-两种模式：`summarize`(默认)向旧上下文追加压缩 Prompt，提取 `[summary]` 后包装为 `[context_summary]` 用户文本，在**全新的模型上下文**中继续；`discard` 直接丢弃旧上下文。系统标记统一写作 `[tag]…[/tag]`；读取旧 Trace 与旧压缩 Prompt 时仍识别早期的尖括号形式（`<summary>`、`<context_summary>` 等）。摘要提取自带容忍阶梯：优先取第一个非空的 `[summary]` 标签对；标签对全为空时，改取剥离标签后剩余的全部文本（兼容把正文写在闭合标签之后的模型）；完全没有标签则整段输出照用。压缩时 [Trace 文件随之轮转](/sessions-and-traces)(`_002`、`_003`……)，一个 Trace 文件恒等于一个完整模型上下文。`session.compact()` 前可用 `compactability()` 探询可行性(`ok | unsupported | empty | just_compacted`)。
+两种模式：`summarize`(默认)向旧上下文追加压缩 Prompt，提取 `[summary]` 后包装为 `[context_summary]` 用户文本，在**全新的模型上下文**中继续；`discard` 直接丢弃旧上下文。系统标记统一写作 `[tag]…[/tag]`；读取旧持久化 Prompt 时仍识别早期的尖括号形式（`<summary>`、`<context_summary>` 等）。摘要提取优先取第一个非空的 `[summary]` 标签对；标签对全为空时取剥离标签后的正文；完全没有标签则整段输出照用。压缩继续写入同一个逻辑 Trace，并在成功的 `compaction_end` 后发布 [Context checkpoint](/sessions-and-traces)。`session.compact()` 前可用 `compactability()` 探询可行性(`ok | unsupported | empty | just_compacted`)。
 
-压缩请求**保持会话工具集不变**——请求前缀（含工具列表）与普通轮次逐字节一致，确保上下文最大的时刻提供商的提示词缓存依然有效。只有得到有效摘要，压缩才算成功：若响应中出现工具调用、或提取出的摘要为空，视同一次普通的失败尝试——工具调用先以合成的失败输出逐一应答（保持 `tool_use`/`tool_result` 配对完整），重发的请求在压缩 Prompt 前附加一条纠正说明（已提交的历史只能追加、不能改写，改写会使提示词缓存失效）。所有失败——无效摘要与 `failed`/`timeout`/`malformed` 传输失败——共用上文「自动重连」一节的同一重连预算与退避阶梯；只有 `auth` 会让压缩当场停止。预算耗尽后压缩以 `failed` 结束，保留原上下文与 Trace 文件，等待下次触发；`compaction_end` 复用统一的重试详情块——`attempt`(最终尝试序号,失败尝试也计入)与失败时的 `error_message` 详情(聊天横幅与 CLI 直接展示)，压缩失败还会作为一条 `compaction_failed` 错误记录进入成本中心。首个**已提交**的尝试（无论被采纳还是被判无效）同时会把折叠进压缩请求的本轮输入（任务中途的工具结果、手动 `/compact` 折叠的补发内容）吸收进旧上下文：重试只重发修复输出与压缩 Prompt，此后也不再重发已吸收的输入。
+压缩请求**保持会话工具集不变**——请求前缀（含工具列表）与普通 Agent Step 逐字节一致，确保上下文最大的时刻提供商的提示词缓存依然有效。只有得到有效摘要，压缩才算成功：若响应中出现工具调用、或提取出的摘要为空，视同一次普通的失败尝试——工具调用先以合成的失败输出逐一应答（保持 `tool_use`/`tool_result` 配对完整），重发的请求在压缩 Prompt 前附加一条纠正说明（已提交的历史只能追加、不能改写，改写会使提示词缓存失效）。所有失败——无效摘要与 `failed`/`timeout`/`malformed` 传输失败——共用上文「自动重连」一节的同一重连预算与退避阶梯；只有 `auth` 会让压缩当场停止。预算耗尽后压缩以 `failed` 结束，保留原 Context 等待下次触发；`compaction_end` 复用统一的重试详情块——`attempt`(最终尝试序号,失败尝试也计入)与失败时的 `error_message` 详情(聊天横幅与 CLI 直接展示)，压缩失败还会作为一条 `compaction_failed` 错误记录进入成本中心。首个**已提交**的尝试（无论被采纳还是被判无效）同时会把折叠进压缩请求的本 Step 输入（任务中途的工具结果、手动 `/compact` 折叠的补发内容）吸收进旧上下文：重试只重发修复输出与压缩 Prompt，此后也不再重发已吸收的输入。
 
 被放弃的压缩**留待补做**，而不是就地兜底。任务中途按打断的同一套流程收场：本轮尚未了结的状态按同一条「是否已提交」规则转入 carry-over，以 `abort` 事件结束本次运行，下一条消息把 carry-over 与用户输入合并重发——阈值依然超标，压缩在那里再次触发。Task 边界上则直接结束本次运行、保留原上下文。两种情形都不合成任何东西去让循环在本该缩小的上下文上硬跑下去。
 
@@ -137,7 +143,7 @@ interface CompactionSettings {
 
 ## 并发模型
 
-- 同一轮内：审批逐个、执行并发、下一轮输入按原始顺序；
+- 同一 Agent Step 内：审批逐个、执行并发、下一 Step 输入按原始顺序；
 - 同一 Session：同时只有一个 Task 或一次压缩在运行(Server 侧以 409 拒绝并发请求);
 - [Subagent](/tools) 是独立 Session，拥有自己的 Trace 与运行循环，消息以 `origin` 标记转发给父级。
 

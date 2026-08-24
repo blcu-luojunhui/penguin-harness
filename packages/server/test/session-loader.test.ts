@@ -13,7 +13,7 @@ import { createCoreSessionLoader } from "../src/runtime/session-manager.js";
 import { SessionSources } from "../src/runtime/session-sources.js";
 import type { SessionRow } from "../src/db/repos/sessions.js";
 import { HttpError } from "../src/http/errors.js";
-import { makeTempRoot, writeTraceFile } from "./helpers.js";
+import { makeTempRoot, writeLogicalTraceJournal, writeTraceFile } from "./helpers.js";
 
 const PROJECT = "project-loader";
 const AGENT = "default_agent";
@@ -47,6 +47,17 @@ function row(workspace: string): SessionRow {
   };
 }
 
+async function writeV3Session(root: string, payload: SessionMetaPayload): Promise<void> {
+  await writeLogicalTraceJournal(root, PROJECT, AGENT, SID, [
+    {
+      record_type: "session_fact",
+      protocol_version: 3,
+      timestamp: "2026-07-06T11:00:00.000Z",
+      message: sessionMeta(payload),
+    },
+  ]);
+}
+
 describe("session-loader", () => {
   let root: string;
 
@@ -65,10 +76,7 @@ describe("session-loader", () => {
   });
 
   it("Trace exists but the Workspace was deleted → 409 session_unrecoverable, original message preserved", async () => {
-    await writeTraceFile(root, PROJECT, AGENT, "2026-07-06", SID, 1, [
-      sessionMeta(meta()), // workspace points to a nonexistent directory
-      userText("hi"),
-    ]);
+    await writeV3Session(root, meta()); // workspace points to a nonexistent directory
     const loader = createCoreSessionLoader(root);
     const err = await loader.load(row("/tmp/does-not-exist-xyz")).catch((e) => e);
     expect(err).toBeInstanceOf(HttpError);
@@ -80,10 +88,7 @@ describe("session-loader", () => {
   it("Trace exists but the Model was removed from config → 409 session_unrecoverable", async () => {
     const ws = path.join(root, "ws");
     await fs.mkdir(ws, { recursive: true });
-    await writeTraceFile(root, PROJECT, AGENT, "2026-07-06", SID, 1, [
-      sessionMeta(meta({ model_id: "removed-model", workspace: ws })),
-      userText("hi"),
-    ]);
+    await writeV3Session(root, meta({ model_id: "removed-model", workspace: ws }));
     const loader = createCoreSessionLoader(root);
     const err = await loader.load(row(ws)).catch((e) => e);
     expect(err).toBeInstanceOf(HttpError);
@@ -97,6 +102,17 @@ describe("session-loader", () => {
     const err = await loader.load(row("/tmp/gone-workspace-abc")).catch((e) => e);
     expect(err).toBeInstanceOf(HttpError);
     expect((err as HttpError).status).toBe(409);
+    expect((err as HttpError).code).toBe("workspace_missing");
+  });
+
+  it("a legacy shard is not treated as a resumable v3 Session", async () => {
+    await writeTraceFile(root, PROJECT, AGENT, "2026-07-06", SID, 1, [
+      sessionMeta(meta()),
+      userText("legacy"),
+    ]);
+    const loader = createCoreSessionLoader(root);
+    const err = await loader.load(row("/tmp/does-not-exist-xyz")).catch((error) => error);
+    expect(err).toBeInstanceOf(HttpError);
     expect((err as HttpError).code).toBe("workspace_missing");
   });
 

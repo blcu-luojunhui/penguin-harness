@@ -84,6 +84,8 @@ import type {
   TraceEventsResponse,
   TraceImportRequest,
   TraceImportResponse,
+  TraceRootResponse,
+  TraceRootsResponse,
   UiPrefs,
   UpdateCheckResponse,
   UpdateRunResponse,
@@ -566,6 +568,25 @@ export const getAgentTraceAnalysis = (
   apiFetch<TraceAnalysisResponse>(
     `/api/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agentId)}` +
       `/traces/${encodeURIComponent(sessionId)}/${index}/analysis`,
+  );
+
+/** Session-scoped protocol-v3 logical Trace roots in their persisted append order. */
+export const getAgentTraceRoots = (projectId: string, agentId: string, sessionId: string) =>
+  apiFetch<TraceRootsResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agentId)}` +
+      `/traces/${encodeURIComponent(sessionId)}/roots`,
+  );
+
+/** Complete records and Task/Step inventory for one protocol-v3 logical Trace root. */
+export const getAgentTraceRoot = (
+  projectId: string,
+  agentId: string,
+  sessionId: string,
+  traceId: string,
+) =>
+  apiFetch<TraceRootResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agentId)}` +
+      `/traces/${encodeURIComponent(sessionId)}/roots/${encodeURIComponent(traceId)}`,
   );
 
 /** Trace file download URL: the server sets Content-Disposition attachment, usable directly in <a download>. */

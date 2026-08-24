@@ -17,6 +17,7 @@ import {
   requestBegin,
   requestEnd,
   sessionMeta,
+  subagentEvent,
   thinkingMessage,
   tokenUsage,
   toolCall,
@@ -24,18 +25,148 @@ import {
   userText,
   withOrigin,
 } from "@prismshadow/penguin-core";
-import type { OmniMessage, SessionMetaPayload, TokenCounts } from "@prismshadow/penguin-core";
+import type {
+  OmniMessage,
+  SessionMetaPayload,
+  SpanStatus,
+  TokenCounts,
+} from "@prismshadow/penguin-core";
 import type { TraceService } from "../src/services/trace-service.js";
 import type { SessionRow } from "../src/db/repos/sessions.js";
 import { SessionSources } from "../src/runtime/session-sources.js";
-import { makeTempRoot, makeTraceHarness, writeTraceFile } from "./helpers.js";
+import {
+  makeTempRoot,
+  makeTraceHarness,
+  writeLogicalTraceEvents,
+  writeLogicalTraceJournal,
+  writeTraceFile,
+} from "./helpers.js";
 
 const P = "project-t";
 const A = "agent-t";
 const S = "session-2026-07-05-10-00-00-aabbccdd";
+const TURN_1 = "turn-aabbccdd-0001";
+const TURN_2 = "turn-aabbccdd-0002";
+const CHILD_SESSION = "session-2026-07-05-10-01-00-child001";
+const TRACE_TASK = "trace-task-aabbccdd";
+const TRACE_GOAL = "trace-goal-aabbccdd";
+const TASK_1 = "task-aabbccdd-0001";
+const CHILD_TRACE = "trace-child-aabbccdd";
+const CHILD_TASK = "task-child-aabbccdd";
 
 function at(ts: string, msg: OmniMessage): OmniMessage {
   return { ...msg, timestamp: ts };
+}
+
+function asLegacy(msg: OmniMessage): OmniMessage {
+  const copy = { ...msg };
+  delete copy.protocol_version;
+  delete copy.event_id;
+  delete copy.trace;
+  return copy;
+}
+
+function spanRecord(args: {
+  type: "span_begin" | "span_end";
+  kind: "agent.turn" | "llm.request";
+  turnId: string;
+  spanId: string;
+  parentSpanId?: string;
+  status?: SpanStatus;
+}): OmniMessage {
+  return {
+    timestamp: "2026-07-05T00:00:00.000Z",
+    type: "event_msg",
+    protocol_version: 2,
+    event_id: `event-${args.type}-${args.spanId}`,
+    trace: {
+      turn_id: args.turnId,
+      span_id: args.spanId,
+      ...(args.parentSpanId !== undefined ? { parent_span_id: args.parentSpanId } : {}),
+    },
+    payload: {
+      type: args.type,
+      span_kind: args.kind,
+      ...(args.type === "span_end" ? { status: args.status ?? "completed" } : {}),
+    },
+  } as unknown as OmniMessage;
+}
+
+function legacyV2Record(
+  message: OmniMessage,
+  trace: { turn_id: string; span_id?: string; parent_span_id?: string },
+): OmniMessage {
+  return { ...message, protocol_version: 2, trace } as unknown as OmniMessage;
+}
+
+function traceLink(args: {
+  sessionId?: string;
+  traceId: string;
+  rootKind: "goal_run" | "task";
+  taskId?: string;
+}): Record<string, unknown> {
+  return {
+    record_type: "trace_link",
+    protocol_version: 3,
+    timestamp: "2026-07-05T10:00:00.000Z",
+    session_id: args.sessionId ?? S,
+    trace_id: args.traceId,
+    root_kind: args.rootKind,
+    ...(args.taskId !== undefined ? { task_id: args.taskId } : {}),
+  };
+}
+
+function sessionFormat(sessionId = S): Record<string, unknown> {
+  return {
+    record_type: "session_format",
+    protocol_version: 3,
+    format: "penguin.trace.session",
+    format_version: 1,
+    timestamp: "2026-07-05T09:59:59.000Z",
+    session_id: sessionId,
+  };
+}
+
+function traceEventLink(
+  traceId: string,
+  message: OmniMessage,
+  sessionId = S,
+): Record<string, unknown> {
+  if (message.event_id === undefined) throw new Error("v3 fixture event is missing event_id");
+  return {
+    record_type: "trace_event_link",
+    protocol_version: 3,
+    timestamp: message.timestamp,
+    session_id: sessionId,
+    trace_id: traceId,
+    event_id: message.event_id,
+  };
+}
+
+function v3Event(args: {
+  eventId: string;
+  traceId?: string;
+  timestamp: string;
+  payload: Record<string, unknown>;
+  taskId?: string;
+  stepId?: string;
+  spanId?: string;
+  parentSpanId?: string;
+}): OmniMessage {
+  return {
+    timestamp: args.timestamp,
+    protocol_version: 3,
+    event_id: args.eventId,
+    type: "event_msg",
+    payload: args.payload,
+    trace: {
+      trace_id: args.traceId ?? TRACE_TASK,
+      ...(args.taskId !== undefined ? { task_id: args.taskId } : {}),
+      ...(args.stepId !== undefined ? { step_id: args.stepId } : {}),
+      ...(args.spanId !== undefined ? { span_id: args.spanId } : {}),
+      ...(args.parentSpanId !== undefined ? { parent_span_id: args.parentSpanId } : {}),
+    },
+  } as unknown as OmniMessage;
 }
 
 function counts(total: number): TokenCounts {
@@ -118,6 +249,273 @@ describe("trace-service", () => {
     expect(messages).toHaveLength(1);
   });
 
+  it("logical roots: projects roots and Tasks in Session-journal link order", async () => {
+    await writeLogicalTraceJournal(root, P, "child-agent", CHILD_SESSION, [
+      sessionFormat(CHILD_SESSION),
+      traceLink({
+        sessionId: CHILD_SESSION,
+        traceId: CHILD_TRACE,
+        rootKind: "task",
+        taskId: CHILD_TASK,
+      }),
+    ]);
+
+    // Write the Task first: inventory order comes from session.jsonl, never directory order.
+    const taskEvents = [
+      v3Event({
+        eventId: "root-end",
+        timestamp: "2026-07-05T10:00:11.000Z",
+        payload: { type: "trace_end", root_kind: "task", status: "completed" },
+      }),
+      v3Event({
+        eventId: "task-end",
+        timestamp: "2026-07-05T10:00:10.000Z",
+        taskId: TASK_1,
+        spanId: "span-task-1",
+        payload: { type: "span_end", span_kind: "agent.task", status: "completed" },
+      }),
+      v3Event({
+        eventId: "step-b-end",
+        timestamp: "2026-07-05T10:00:09.000Z",
+        taskId: TASK_1,
+        stepId: "step-b",
+        spanId: "span-step-b",
+        payload: { type: "span_end", span_kind: "agent.step", status: "completed" },
+      }),
+      v3Event({
+        eventId: "root-begin",
+        timestamp: "2026-07-05T10:00:00.000Z",
+        payload: { type: "trace_begin", root_kind: "task" },
+      }),
+      v3Event({
+        eventId: "task-begin",
+        timestamp: "2026-07-05T10:00:01.000Z",
+        taskId: TASK_1,
+        spanId: "span-task-1",
+        payload: { type: "span_begin", span_kind: "agent.task", capabilities: {} },
+      }),
+      v3Event({
+        eventId: "step-b-begin",
+        timestamp: "2026-07-05T10:00:05.000Z",
+        taskId: TASK_1,
+        stepId: "step-b",
+        spanId: "span-step-b",
+        payload: { type: "span_begin", span_kind: "agent.step", capabilities: {} },
+      }),
+      v3Event({
+        eventId: "future-event",
+        timestamp: "2026-07-05T10:00:06.000Z",
+        taskId: TASK_1,
+        stepId: "step-b",
+        spanId: "span-step-b",
+        payload: { type: "future_protocol_event", value: 1 },
+      }),
+      v3Event({
+        eventId: "subagent-session",
+        timestamp: "2026-07-05T10:00:07.000Z",
+        taskId: TASK_1,
+        stepId: "step-b",
+        spanId: "span-subagent-session",
+        payload: { type: "subagent", session_id: CHILD_SESSION },
+      }),
+      v3Event({
+        eventId: "step-a-begin",
+        timestamp: "2026-07-05T10:00:02.000Z",
+        taskId: TASK_1,
+        stepId: "step-a",
+        spanId: "span-step-a",
+        payload: { type: "span_begin", span_kind: "agent.step", capabilities: {} },
+      }),
+      v3Event({
+        eventId: "subagent-exact",
+        timestamp: "2026-07-05T10:00:03.000Z",
+        taskId: TASK_1,
+        stepId: "step-a",
+        spanId: "span-subagent-exact",
+        payload: {
+          type: "subagent",
+          session_id: CHILD_SESSION,
+          trace_id: CHILD_TRACE,
+          task_id: CHILD_TASK,
+        },
+      }),
+      v3Event({
+        eventId: "step-a-end",
+        timestamp: "2026-07-05T10:00:04.000Z",
+        taskId: TASK_1,
+        stepId: "step-a",
+        spanId: "span-step-a",
+        payload: { type: "span_end", span_kind: "agent.step", status: "completed" },
+      }),
+    ];
+    await writeLogicalTraceEvents(root, P, A, S, TRACE_TASK, taskEvents);
+
+    const goalEvents = [
+      v3Event({
+        eventId: "goal-begin",
+        traceId: TRACE_GOAL,
+        timestamp: "2026-07-05T09:00:00.000Z",
+        payload: { type: "trace_begin", root_kind: "goal_run" },
+      }),
+      v3Event({
+        eventId: "goal-task-begin",
+        traceId: TRACE_GOAL,
+        timestamp: "2026-07-05T09:00:01.000Z",
+        taskId: "goal-task-1",
+        spanId: "span-goal-task-1",
+        payload: { type: "span_begin", span_kind: "agent.task", capabilities: {} },
+      }),
+    ];
+    const goalFile = await writeLogicalTraceEvents(root, P, A, S, TRACE_GOAL, goalEvents);
+    await fs.appendFile(goalFile, '{"protocol_version":3', "utf8");
+
+    const byEventId = new Map(taskEvents.map((event) => [event.event_id!, event]));
+    const journalTaskOrder = [
+      "root-begin",
+      "task-begin",
+      "step-b-begin",
+      "future-event",
+      "subagent-session",
+      "step-a-begin",
+      "subagent-exact",
+      "step-a-end",
+      "step-b-end",
+      "task-end",
+      "root-end",
+    ].map((eventId) => byEventId.get(eventId)!);
+    await writeLogicalTraceJournal(root, P, A, S, [
+      sessionFormat(),
+      traceLink({ traceId: TRACE_GOAL, rootKind: "goal_run" }),
+      ...goalEvents.map((event) => traceEventLink(TRACE_GOAL, event)),
+      traceLink({ traceId: TRACE_TASK, rootKind: "task", taskId: TASK_1 }),
+      ...journalTaskOrder.map((event) => traceEventLink(TRACE_TASK, event)),
+    ]);
+
+    const inventory = await service.readRoots(P, A, S);
+    expect(inventory).toMatchObject({ supported: true, protocolVersion: 3 });
+    expect(inventory.roots.map((rootSummary) => rootSummary.traceId)).toEqual([
+      TRACE_GOAL,
+      TRACE_TASK,
+    ]);
+    expect(inventory.roots[0]).toMatchObject({
+      rootKind: "goal_run",
+      recordCount: 2,
+      taskCount: 1,
+      partial: true,
+    });
+    expect(inventory.roots[1]).toMatchObject({
+      rootKind: "task",
+      startTs: "2026-07-05T10:00:00.000Z",
+      endTs: "2026-07-05T10:00:11.000Z",
+      status: "completed",
+      recordCount: 11,
+      taskCount: 1,
+      partial: false,
+    });
+
+    const detail = await service.readRoot(P, A, S, TRACE_TASK);
+    expect(detail.records.map((record) => record.event_id)).toEqual(
+      journalTaskOrder.map((record) => record.event_id),
+    );
+    expect(detail.tasks).toHaveLength(1);
+    expect(detail.tasks[0]).toMatchObject({
+      taskId: TASK_1,
+      spanId: "span-task-1",
+      recordCount: 9,
+      partial: false,
+    });
+    // Journal link order wins over both payload-file order and timestamps.
+    expect(detail.tasks[0]!.steps.map((step) => step.stepId)).toEqual(["step-b", "step-a"]);
+    expect(detail.tasks[0]!.steps[0]).toMatchObject({ recordCount: 4, partial: false });
+    expect(detail.subagents).toEqual([
+      {
+        sessionId: CHILD_SESSION,
+        agentId: "child-agent",
+        invocationSpanId: "span-subagent-session",
+        eventId: "subagent-session",
+      },
+      {
+        sessionId: CHILD_SESSION,
+        agentId: "child-agent",
+        childTraceId: CHILD_TRACE,
+        childTaskId: CHILD_TASK,
+        invocationSpanId: "span-subagent-exact",
+        eventId: "subagent-exact",
+      },
+    ]);
+  });
+
+  it("logical roots: V1/v2 is unsupported and detail never infers a root", async () => {
+    await writeTraceFile(root, P, A, "2026-07-05", S, 1, [
+      asLegacy(userText("v1")),
+      spanRecord({
+        type: "span_begin",
+        kind: "agent.turn",
+        turnId: TURN_1,
+        spanId: "span-turn-v2",
+      }),
+    ]);
+    await expect(service.readRoots(P, A, S)).resolves.toEqual({
+      supported: false,
+      protocolVersion: null,
+      roots: [],
+    });
+    await expect(service.readRoot(P, A, S, TRACE_TASK)).rejects.toMatchObject({
+      status: 404,
+      code: "trace_root_not_found",
+    });
+  });
+
+  it("logical roots: a journaled root with a missing events file remains visible as partial", async () => {
+    await writeLogicalTraceJournal(root, P, A, S, [
+      sessionFormat(),
+      traceLink({ traceId: TRACE_TASK, rootKind: "task", taskId: TASK_1 }),
+    ]);
+    await expect(service.readRoots(P, A, S)).resolves.toEqual({
+      supported: true,
+      protocolVersion: 3,
+      roots: [
+        {
+          traceId: TRACE_TASK,
+          rootKind: "task",
+          recordCount: 0,
+          taskCount: 1,
+          partial: true,
+        },
+      ],
+      diagnostics: [
+        {
+          code: "missing_trace_event_file",
+          sessionId: S,
+          traceId: TRACE_TASK,
+          message: `Trace ${TRACE_TASK} is linked from the Session journal, but its events.jsonl file is missing.`,
+        },
+      ],
+    });
+    const detail = await service.readRoot(P, A, S, TRACE_TASK);
+    expect(detail.records).toEqual([]);
+    expect(detail.tasks).toEqual([
+      {
+        taskId: TASK_1,
+        recordCount: 0,
+        partial: true,
+        steps: [],
+      },
+    ]);
+    expect(detail.diagnostics?.map((diagnostic) => diagnostic.code)).toEqual([
+      "missing_trace_event_file",
+    ]);
+    const full = await service.readMessagesResult(P, A, S);
+    expect(full.messages).toEqual([]);
+    expect(full.history?.partial).toBe(true);
+    expect(full.history?.diagnostics.map((diagnostic) => diagnostic.code)).toEqual([
+      "missing_trace_event_file",
+    ]);
+    const page = await service.readMessagesPage(P, A, S, { kind: "tail", limit: 1 });
+    expect(page.messages).toEqual([]);
+    expect(page.history).toEqual(full.history);
+  });
+
   it("traces listing: index / date / size / mtime", async () => {
     await writeTraceFile(root, P, A, "2026-07-05", S, 1, [userText("a")]);
     await writeTraceFile(root, P, A, "2026-07-06", S, 2, [userText("bb")]);
@@ -138,6 +536,200 @@ describe("trace-service", () => {
     expect((page.events[0]!.payload as { text: string }).text).toBe("m3");
     const notFound = await service.readEvents(P, A, S, 99, 0, 10).catch((e: unknown) => e);
     expect((notFound as { status: number }).status).toBe(404);
+  });
+
+  it("explicit Turns: lists root Span lifecycles and returns one Turn's raw v2 records", async () => {
+    await writeTraceFile(root, P, A, "2026-07-05", S, 1, [
+      sessionMeta(metaPayload()),
+      at(
+        "2026-07-05T10:00:00.000Z",
+        spanRecord({
+          type: "span_begin",
+          kind: "agent.turn",
+          turnId: TURN_1,
+          spanId: "span-turn-1",
+        }),
+      ),
+      at(
+        "2026-07-05T10:00:01.000Z",
+        spanRecord({
+          type: "span_begin",
+          kind: "llm.request",
+          turnId: TURN_1,
+          spanId: "span-request-1",
+          parentSpanId: "span-turn-1",
+        }),
+      ),
+      at(
+        "2026-07-05T10:00:02.000Z",
+        spanRecord({
+          type: "span_end",
+          kind: "llm.request",
+          turnId: TURN_1,
+          spanId: "span-request-1",
+          parentSpanId: "span-turn-1",
+          status: "completed",
+        }),
+      ),
+      at(
+        "2026-07-05T10:00:03.000Z",
+        spanRecord({
+          type: "span_end",
+          kind: "agent.turn",
+          turnId: TURN_1,
+          spanId: "span-turn-1",
+          status: "completed",
+        }),
+      ),
+      at(
+        "2026-07-05T10:00:04.000Z",
+        spanRecord({
+          type: "span_begin",
+          kind: "agent.turn",
+          turnId: TURN_2,
+          spanId: "span-turn-2",
+        }),
+      ),
+    ]);
+
+    const listed = await service.readTurns(P, A, S, 1);
+    expect(listed).toEqual({
+      supported: true,
+      protocolVersion: 2,
+      turns: [
+        {
+          turnId: TURN_1,
+          rootSpanId: "span-turn-1",
+          startTs: "2026-07-05T10:00:00.000Z",
+          endTs: "2026-07-05T10:00:03.000Z",
+          status: "completed",
+          recordCount: 4,
+        },
+        {
+          turnId: TURN_2,
+          rootSpanId: "span-turn-2",
+          startTs: "2026-07-05T10:00:04.000Z",
+          recordCount: 1,
+        },
+      ],
+    });
+
+    const detail = await service.readTurn(P, A, S, 1, TURN_1);
+    expect(detail.protocolVersion).toBe(2);
+    expect(detail.turn).toEqual(listed.turns[0]);
+    expect(detail.records).toHaveLength(4);
+    expect(
+      detail.records.every(
+        (record) =>
+          (record as OmniMessage & { trace?: { turn_id?: string } }).trace?.turn_id === TURN_1,
+      ),
+    ).toBe(true);
+  });
+
+  it("explicit Turns: resolves and deduplicates navigable subagent pointers", async () => {
+    await writeTraceFile(root, P, "child-agent", "2026-07-05", CHILD_SESSION, 1, [
+      sessionMeta(metaPayload({ session_id: CHILD_SESSION })),
+    ]);
+    const childPointer = legacyV2Record(subagentEvent(CHILD_SESSION), {
+      turn_id: TURN_1,
+      span_id: "span-subagent-1",
+      parent_span_id: "span-turn-1",
+    });
+    const duplicatePointer = legacyV2Record(subagentEvent(CHILD_SESSION), {
+      turn_id: TURN_1,
+      span_id: "span-subagent-2",
+      parent_span_id: "span-turn-1",
+    });
+    const missingPointer = legacyV2Record(subagentEvent("session-2026-07-05-10-02-00-missing1"), {
+      turn_id: TURN_1,
+      span_id: "span-subagent-missing",
+      parent_span_id: "span-turn-1",
+    });
+    await writeTraceFile(root, P, A, "2026-07-05", S, 1, [
+      spanRecord({
+        type: "span_begin",
+        kind: "agent.turn",
+        turnId: TURN_1,
+        spanId: "span-turn-1",
+      }),
+      childPointer,
+      duplicatePointer,
+      missingPointer,
+      spanRecord({
+        type: "span_end",
+        kind: "agent.turn",
+        turnId: TURN_1,
+        spanId: "span-turn-1",
+        status: "completed",
+      }),
+      legacyV2Record(subagentEvent(CHILD_SESSION), {
+        turn_id: TURN_2,
+        span_id: "span-other-turn",
+      }),
+    ]);
+
+    const detail = await service.readTurn(P, A, S, 1, TURN_1);
+    expect(detail.subagents).toEqual([{ sessionId: CHILD_SESSION, agentId: "child-agent" }]);
+    expect(detail.records).toHaveLength(5);
+    expect(
+      detail.records.some(
+        (record) =>
+          record.type === "event_msg" &&
+          (record.payload as { session_id?: string }).session_id ===
+            "session-2026-07-05-10-02-00-missing1",
+      ),
+    ).toBe(true);
+  });
+
+  it("explicit Turns: does not infer V1 records and returns 404 for a missing Turn", async () => {
+    await writeTraceFile(root, P, A, "2026-07-05", S, 1, [asLegacy(userText("legacy"))]);
+
+    await expect(service.readTurns(P, A, S, 1)).resolves.toEqual({
+      supported: false,
+      protocolVersion: null,
+      turns: [],
+    });
+    const missing = await service.readTurn(P, A, S, 1, TURN_1).catch((error: unknown) => error);
+    expect(missing).toMatchObject({ status: 404, code: "trace_turn_not_found" });
+  });
+
+  it("explicit Turns: pairs a root end that arrived before its begin", async () => {
+    await writeTraceFile(root, P, A, "2026-07-05", S, 1, [
+      at(
+        "2026-07-05T10:00:03.000Z",
+        spanRecord({
+          type: "span_end",
+          kind: "agent.turn",
+          turnId: TURN_1,
+          spanId: "span-turn-1",
+          status: "completed",
+        }),
+      ),
+      at(
+        "2026-07-05T10:00:00.000Z",
+        spanRecord({
+          type: "span_begin",
+          kind: "agent.turn",
+          turnId: TURN_1,
+          spanId: "span-turn-1",
+        }),
+      ),
+    ]);
+
+    await expect(service.readTurns(P, A, S, 1)).resolves.toEqual({
+      supported: true,
+      protocolVersion: 2,
+      turns: [
+        {
+          turnId: TURN_1,
+          rootSpanId: "span-turn-1",
+          startTs: "2026-07-05T10:00:00.000Z",
+          endTs: "2026-07-05T10:00:03.000Z",
+          status: "completed",
+          recordCount: 2,
+        },
+      ],
+    });
   });
 
   it("performance analysis: Request pairing, tool durations, reconnect / compaction counts, Token trend", async () => {

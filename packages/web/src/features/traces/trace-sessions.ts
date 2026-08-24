@@ -3,7 +3,11 @@
  * testable): mapping either server response shape to the page's Session groups, and
  * partitioning rows by their server-classified category.
  */
-import type { AgentTracesResponse, SessionCategory } from "@prismshadow/penguin-server/api";
+import type {
+  AgentTracesResponse,
+  SessionCategory,
+  TraceRootsResponse,
+} from "@prismshadow/penguin-server/api";
 
 /**
  * Trace page sessions fetched per (group, category) page, and the per-group display cap
@@ -47,6 +51,22 @@ export interface TraceSessionGroup {
 /** A pooled row of the Trace tree: the group plus its owning Agent (the fetch that produced it). */
 export interface TraceSessionRow extends TraceSessionGroup {
   agentId: string;
+}
+
+export interface TraceSessionSelection {
+  agentId: string;
+  sessionId: string;
+  title?: string;
+  files: TraceFileRef[];
+}
+
+/** A supported roots response is sufficient to open a fileless v3 Session directly. */
+export function logicalTraceSelection(
+  agentId: string,
+  sessionId: string,
+  inventory: TraceRootsResponse,
+): TraceSessionSelection | null {
+  return inventory.supported ? { agentId, sessionId, files: [] } : null;
 }
 
 /**

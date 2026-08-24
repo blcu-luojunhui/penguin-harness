@@ -17,16 +17,22 @@ import {
   abortEvent,
   assistantText,
   compactionBegin,
+  compactionEnd,
   requestBegin,
   requestEnd,
   sessionMeta,
+  spanBegin,
+  spanEnd,
   tokenUsage,
   toolCall,
+  traceBegin,
+  traceEnd,
   userText,
+  withTraceContext,
 } from "../src/omnimessage/index.js";
 import type { OmniMessage, TokenCounts } from "../src/omnimessage/index.js";
 import { GenerativeModel, groupHistoryToUniMessages } from "../src/llm/index.js";
-import { readTrace } from "../src/trace/index.js";
+import { readTrace, TraceStore } from "../src/trace/index.js";
 import { tracesDir } from "../src/state/paths.js";
 import { stubProviderKeys } from "./provider-keys.js";
 
@@ -61,21 +67,34 @@ const usage = (total: number): TokenCounts => ({
   total,
 });
 
-/** Manually constructs a session's trace file (simulating a record left behind by a previous process). */
+/** Manually constructs a protocol-v3 Session bundle left behind by a previous process. */
 async function writeTraceFile(
   root: string,
   sessionId: string,
   messages: OmniMessage[],
   opts?: { dateDir?: string; index?: string },
 ): Promise<string> {
-  const dir = path.join(
-    tracesDir(root, "default_project", "default_agent"),
-    opts?.dateDir ?? "2026-07-06",
+  const store = new TraceStore({
+    tracesDir: tracesDir(root, "default_project", "default_agent"),
+    sessionId,
+  });
+  const meta = messages.find((message) => message.type === "session_meta");
+  if (meta) await store.write(meta);
+  const execution = messages.filter((message) => message.type !== "session_meta");
+  if (execution.length === 0) return store.sessionPath();
+  const suffix = opts?.index ?? "001";
+  const traceId = `trace-${suffix}`;
+  const taskId = `task-${suffix}`;
+  await store.write(traceBegin({ rootKind: "task", traceId, taskId }));
+  await store.write(spanBegin({ kind: "agent.task", traceId, taskId, spanId: taskId }));
+  for (const message of execution) {
+    await store.write(withTraceContext(message, { trace_id: traceId, task_id: taskId }));
+  }
+  await store.write(
+    spanEnd({ kind: "agent.task", traceId, taskId, spanId: taskId, status: "completed" }),
   );
-  await fs.mkdir(dir, { recursive: true });
-  const file = path.join(dir, `${sessionId}_${opts?.index ?? "001"}.jsonl`);
-  await fs.writeFile(file, messages.map((m) => JSON.stringify(m)).join("\n") + "\n", "utf8");
-  return file;
+  await store.write(traceEnd({ rootKind: "task", traceId, taskId, status: "completed" }));
+  return store.tracePath(traceId);
 }
 
 function metaFor(
@@ -120,6 +139,32 @@ describe("agent.resumeSession", () => {
     );
     expect(texts).toEqual(["hello", "hi there"]);
   });
+
+  it.each(["text", "request_end", "compaction_end"])(
+    "fails closed when a journal-linked %s payload is missing",
+    async (missingType) => {
+      const agent = await createAgent({});
+      const eventPath = await writeTraceFile(tmpRoot, SID, [
+        metaFor(SID, workspace),
+        userText("hello"),
+        requestBegin(),
+        assistantText("hi"),
+        requestEnd("completed"),
+        compactionBegin({ reason: "manual", mode: "discard", context: 1, turns: 1 }),
+        compactionEnd({ reason: "manual", mode: "discard", status: "completed" }),
+      ]);
+      const lines = (await fs.readFile(eventPath, "utf8")).trim().split("\n");
+      const filtered = lines.filter((line) => {
+        const message = JSON.parse(line) as OmniMessage;
+        return (message.payload as { type?: string }).type !== missingType;
+      });
+      await fs.writeFile(eventPath, `${filtered.join("\n")}\n`, "utf8");
+
+      await expect(agent.resumeSession({ sessionId: SID })).rejects.toThrow(
+        /Session Trace is partial/,
+      );
+    },
+  );
 
   it("preserves the stored session source across resume (and its absence for user sessions)", async () => {
     const agent = await createAgent({});
@@ -218,6 +263,47 @@ describe("agent.resumeSession", () => {
     expect((await readTrace(file)).length).toBe(closed.length);
   });
 
+  it("closes a dangling compaction on its original Trace without swallowing a later root", async () => {
+    const dir = tracesDir(tmpRoot, "default_project", "default_agent");
+    const store = new TraceStore({ tracesDir: dir, sessionId: SID });
+    await store.write(metaFor(SID, workspace));
+    await store.write(traceBegin({ rootKind: "task", traceId: "trace-a", taskId: "task-a" }));
+    const dangling = withTraceContext(
+      compactionBegin({ reason: "manual", mode: "summarize", context: 1, turns: 1 }),
+      { trace_id: "trace-a", task_id: "task-a", step_id: "step-a", span_id: "span-a" },
+    );
+    await store.write(dangling);
+    await store.write(traceBegin({ rootKind: "task", traceId: "trace-b", taskId: "task-b" }));
+    for (const message of [
+      userText("later question"),
+      requestBegin(),
+      assistantText("later answer"),
+      requestEnd("completed"),
+    ]) {
+      await store.write(
+        withTraceContext(message, { trace_id: "trace-b", task_id: "task-b", step_id: "step-b" }),
+      );
+    }
+
+    const agent = await createAgent({});
+    const session = await agent.resumeSession({ sessionId: SID });
+    expect(
+      (session.resumedHistory ?? [])
+        .map((message) => (message.payload as { text?: string }).text)
+        .filter(Boolean),
+    ).toEqual(["later question", "later answer"]);
+    const traceA = await readTrace(store.tracePath("trace-a"));
+    const closure = traceA.at(-1)!;
+    expect(closure.payload).toMatchObject({ type: "compaction_end", status: "failed" });
+    expect(closure.trace).toEqual(dangling.trace);
+    expect(
+      (await readTrace(store.tracePath("trace-b"))).some(
+        (message) => (message.payload as { type?: string }).type === "compaction_end",
+      ),
+    ).toBe(false);
+    session.dispose();
+  });
+
   it("ignores a legacy trace's recorded thinking_level; the Agent config always wins", async () => {
     // session_meta no longer carries a thinking level (it became a per-turn run parameter);
     // a `thinking_level` still present in an OLD trace's meta JSON is deliberately ignored —
@@ -283,11 +369,22 @@ describe("agent.resumeSession", () => {
         ((m.payload as { output?: string }).output ?? "").includes("interrupted"),
       ),
     ).toHaveLength(0);
-    // session_meta is never written twice.
-    expect(after.filter((m) => m.type === "session_meta")).toHaveLength(1);
+    // session_meta lives only in the Session journal and is never copied into Trace events.
+    expect(after.filter((m) => m.type === "session_meta")).toHaveLength(0);
+    const journalPath = path.join(path.dirname(path.dirname(path.dirname(file))), "session.jsonl");
+    const journal = (await fs.readFile(journalPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { record_type?: string; message?: OmniMessage });
+    expect(
+      journal.filter(
+        (record) =>
+          record.record_type === "session_fact" && record.message?.type === "session_meta",
+      ),
+    ).toHaveLength(1);
   });
 
-  it("picks the latest index when the context was compacted into multiple files", async () => {
+  it("replays linked logical Traces in Session-journal order", async () => {
     const agent = await createAgent({});
     await writeTraceFile(tmpRoot, SID, [metaFor(SID, workspace), userText("old context")], {
       index: "001",
@@ -310,7 +407,11 @@ describe("agent.resumeSession", () => {
     const texts = (session.resumedHistory ?? []).map(
       (m) => (m.payload as { text?: string }).text ?? "",
     );
-    expect(texts).toEqual(["[context_summary]gist[/context_summary]", "resumed context"]);
+    expect(texts).toEqual([
+      "old context",
+      "[context_summary]gist[/context_summary]",
+      "resumed context",
+    ]);
   });
 
   it("errors when the session does not exist", async () => {
@@ -318,6 +419,21 @@ describe("agent.resumeSession", () => {
     await expect(agent.resumeSession({ sessionId: "session-none" })).rejects.toThrow(
       /Session does not exist/,
     );
+  });
+
+  it("does not read, migrate, or modify legacy date/index Trace files", async () => {
+    const agent = await createAgent({});
+    const legacyDir = path.join(
+      tracesDir(tmpRoot, "default_project", "default_agent"),
+      "2026-07-06",
+    );
+    await fs.mkdir(legacyDir, { recursive: true });
+    const legacyPath = path.join(legacyDir, `${SID}_001.jsonl`);
+    const legacy = `${JSON.stringify(metaFor(SID, workspace))}\n${JSON.stringify(userText("old"))}\n`;
+    await fs.writeFile(legacyPath, legacy, "utf8");
+
+    await expect(agent.resumeSession({ sessionId: SID })).rejects.toThrow(/protocol-v3/);
+    expect(await fs.readFile(legacyPath, "utf8")).toBe(legacy);
   });
 
   it("errors when the recorded workspace no longer exists (PRN-004: no auto-create)", async () => {
@@ -346,7 +462,7 @@ describe("agent.resumeSession", () => {
     const legacy = metaFor(SID, workspace);
     delete (legacy.payload as { provider?: string }).provider;
     await writeTraceFile(tmpRoot, SID, [legacy, userText("x")]);
-    await expect(agent.resumeSession({ sessionId: SID })).rejects.toThrow(/legacy data/);
+    await expect(agent.resumeSession({ sessionId: SID })).rejects.toThrow(/missing provider/);
   });
 
   it("latestSessionId returns the newest session by embedded timestamp", async () => {

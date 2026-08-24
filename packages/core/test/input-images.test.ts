@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { modelVisiblePath } from "../src/internal/model-visible-path.js";
 import { appendAttachmentLines, imagesToScratchpadPaths } from "../src/internal/session-support.js";
-import { Session } from "../src/index.js";
+import { loadV3Session, Session, TraceStore } from "../src/index.js";
 import type {
   EnvironmentInterface,
   LLMInterface,
@@ -273,5 +273,49 @@ describe("Session input-image wiring", () => {
       "text",
       "image_url",
     ]);
+  });
+
+  it.each([
+    ["text plus image", [userText("inspect"), imageUrlMessage(DATA_URL)]],
+    ["image only", [imageUrlMessage(DATA_URL)]],
+  ])("Task audit references the persisted folded input for %s", async (_label, prompt) => {
+    const received: OmniMessage[][] = [];
+    const llm: LLMInterface = {
+      async *streamGenerate(params): AsyncGenerator<OmniMessage, LLMOutcome> {
+        received.push(params.newMessages);
+        yield assistantText("done");
+        return { status: "completed" };
+      },
+    };
+    const trace = new TraceStore({ tracesDir: path.join(tmp, "traces"), sessionId: "session-1" });
+    const session = new Session({
+      meta: meta(),
+      bootstrap: async () => ({ tools: [], llm, mcp: [] }),
+      mcpServers: [],
+      environment: fakeEnvironment,
+      trace,
+      imagesDir: path.join(tmp, "images"),
+      modelHasVision: false,
+    });
+    for await (const _ of session.run(prompt)) {
+      // consume
+    }
+
+    expect(received[0]).toHaveLength(1);
+    const actual = received[0]![0]!;
+    expect((actual.payload as TextPayload).text).toContain("[attached image:");
+    const loaded = await loadV3Session(path.join(tmp, "traces"), "session-1");
+    const taskBegin = loaded!.events.find(
+      (message) =>
+        (message.payload as { type?: string; span_kind?: string }).type === "span_begin" &&
+        (message.payload as { span_kind?: string }).span_kind === "agent.task",
+    )!;
+    const attributes = (taskBegin.payload as { attributes?: Record<string, unknown> }).attributes!;
+    expect(attributes.input_event_ids).toEqual([actual.event_id]);
+    expect(attributes.input_snapshot).toBeUndefined();
+    const inputIndex = loaded!.events.findIndex((message) => message.event_id === actual.event_id);
+    expect(inputIndex).toBeGreaterThanOrEqual(0);
+    expect(inputIndex).toBeLessThan(loaded!.events.indexOf(taskBegin));
+    expect(actual.trace?.trace_id).toBe(taskBegin.trace?.trace_id);
   });
 });

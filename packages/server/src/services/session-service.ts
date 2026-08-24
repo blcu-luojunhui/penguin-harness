@@ -14,7 +14,7 @@
  * Project's default reference, 400 if there is none); the new Session is
  * added to session-manager's active table (state idle).
  */
-import { createAgent, isSessionMeta } from "@prismshadow/penguin-core";
+import { createAgent, findV3Session, isSessionMeta, tracesDir } from "@prismshadow/penguin-core";
 import type { ProxyEnvPolicy } from "@prismshadow/penguin-core";
 import type {
   ApprovalMode,
@@ -29,7 +29,7 @@ import type { SessionRow, SessionsRepo } from "../db/repos/sessions.js";
 import type { SessionManager } from "../runtime/session-manager.js";
 import { asSessionSource } from "../runtime/session-sources.js";
 import type { SessionSources } from "../runtime/session-sources.js";
-import { TraceIndexService, traceFilePath } from "./trace-index.js";
+import { TraceIndexService } from "./trace-index.js";
 import type { ProjectConfigService } from "./project-config-service.js";
 
 const SESSION_ID_TS_RE = /^session-(\d{4})-(\d{2})-(\d{2})-(\d{2})-(\d{2})-(\d{2})-[0-9a-f]{8}$/;
@@ -380,47 +380,22 @@ export class SessionService {
     return this.toInfo(row, false);
   }
 
-  /**
-   * Absolute path of a Session's **latest** Trace file (the current context shard);
-   * undefined when no Trace exists. Costs a directory walk, so only the single-session
-   * GET includes it in the DTO (see SessionInfo.tracePath) — the web's `/model` switch
-   * hands it to the new session's `[model_switch_from]` block so the model can read the
-   * source history itself when it needs it.
-   */
+  /** Absolute path of the complete protocol-v3 Session Trace bundle. */
   async latestTracePath(row: SessionRow): Promise<string | undefined> {
-    await this.deps.traceIndex.reconcileAgent(row.projectId, row.agentId);
-    let files = this.deps.traceIndex.repo.listFilesBySession(
-      row.projectId,
-      row.agentId,
-      row.sessionId,
+    return (
+      (await findV3Session(tracesDir(this.deps.root, row.projectId, row.agentId), row.sessionId)) ??
+      undefined
     );
-    if (files.length === 0) {
-      // Index miss with disk possibly ahead: one forced diff, then retry (the consumers'
-      // rule — a stale index costs one extra scan, never a missing resume shard).
-      await this.deps.traceIndex.reconcileAgent(row.projectId, row.agentId, { force: true });
-      files = this.deps.traceIndex.repo.listFilesBySession(
-        row.projectId,
-        row.agentId,
-        row.sessionId,
-      );
-    }
-    const latest = files.at(-1);
-    return latest === undefined ? undefined : traceFilePath(this.deps.root, latest);
   }
 
-  /**
-   * One walk over the Trace directory: session_id → its **earliest** shard (the shard
-   * whose head carries the original session_meta). Discovery (which Sessions have
-   * records) and the meta-read location come out of a single pass, so classifying every
-   * row (`counts=1`) costs one directory walk total instead of one per Session.
-   */
+  /** Discovers legacy shards and v3 bundles from the reconciled Session-facts index. */
   private async discoverTraces(projectId: string, agentId: string): Promise<Set<string>> {
     await this.deps.traceIndex.reconcileAgent(projectId, agentId);
-    const out = new Set<string>();
-    for (const f of this.deps.traceIndex.repo.listFilesByAgent(projectId, agentId)) {
-      out.add(f.sessionId);
-    }
-    return out;
+    return new Set(
+      this.deps.traceIndex.repo
+        .listSessionsByAgent(projectId, agentId)
+        .map((session) => session.sessionId),
+    );
   }
 
   /**

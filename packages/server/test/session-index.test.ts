@@ -15,7 +15,13 @@ import type {
   SessionsResponse,
 } from "../src/api/types.js";
 import { sessionIdCreatedAt } from "../src/services/session-service.js";
-import { apiClient, createTestApp, provisionUser, writeTraceFile } from "./helpers.js";
+import {
+  apiClient,
+  createTestApp,
+  provisionUser,
+  writeLogicalTraceJournal,
+  writeTraceFile,
+} from "./helpers.js";
 import type { TestApp } from "./helpers.js";
 
 describe("session-index", () => {
@@ -237,6 +243,49 @@ describe("session-index", () => {
     const list = (await (await api.get(`${base()}?cli=1`)).json()) as SessionsResponse;
     expect(list.sessions.find((s) => s.sessionId === adopted)?.source).toBe("schedule");
     expect(list.sessions.find((s) => s.sessionId === junk)?.source).toBeUndefined();
+  });
+
+  it("adopts an unmanaged protocol-v3 Session from its indexed journal facts", async () => {
+    await configureModels();
+    const sessionId = "session-2026-07-03-12-00-00-0badf00f";
+    const payload: SessionMetaPayload = {
+      session_id: sessionId,
+      model_id: "m-v3-cli",
+      provider: "custom",
+      model_context_window: 1000,
+      system_prompt: "",
+      agent_state: "/tmp/a",
+      workspace: "/tmp/w-v3-cli",
+    };
+    await writeLogicalTraceJournal(t.root, projectId, "default_agent", sessionId, [
+      {
+        record_type: "session_fact",
+        protocol_version: 3,
+        timestamp: "2026-07-03T12:00:00.000Z",
+        message: sessionMeta(payload),
+      },
+      {
+        record_type: "trace_link",
+        protocol_version: 3,
+        timestamp: "2026-07-03T12:00:01.000Z",
+        session_id: sessionId,
+        trace_id: "trace-v3-cli-0badf00f",
+        root_kind: "task",
+        task_id: "task-v3-cli-0badf00f",
+      },
+    ]);
+
+    const list = (await (await api.get(`${base()}?cli=1`)).json()) as SessionsResponse;
+    expect(list.sessions.find((session) => session.sessionId === sessionId)).toMatchObject({
+      provider: "custom",
+      modelId: "m-v3-cli",
+      workspace: "/tmp/w-v3-cli",
+      hasTrace: true,
+    });
+    expect(t.deps.sessionsRepo.findById(sessionId)?.client).toBe("cli");
+    expect(
+      t.deps.traceIndex.repo.listFilesBySession(projectId, "default_agent", sessionId),
+    ).toEqual([]);
   });
 
   it("list paging: limit/offset slice the newest-first list; absent params keep the full list; invalid values 400", async () => {
@@ -625,7 +674,7 @@ describe("session-index", () => {
     expect(sessionIdCreatedAt("not-a-session")).toBeNull();
   });
 
-  it("single-session GET exposes tracePath (the LATEST shard); absent without a trace; list rows omit it", async () => {
+  it("single-session GET exposes the v3 Session bundle path and never returns a legacy shard", async () => {
     await configureModels();
     const res = await api.post(base(), {});
     const { session } = (await res.json()) as SessionCreateResponse;
@@ -646,17 +695,33 @@ describe("session-index", () => {
     };
     await writeTraceFile(t.root, projectId, "default_agent", "2026-07-02", session.sessionId, 1, [
       sessionMeta(meta),
-      userText("a"),
+      userText("legacy"),
     ]);
-    await writeTraceFile(t.root, projectId, "default_agent", "2026-07-03", session.sessionId, 2, [
-      sessionMeta(meta),
-      userText("b"),
-    ]);
+    const legacy = (await (
+      await api.get(`/api/sessions/${session.sessionId}`)
+    ).json()) as SessionResponse;
+    expect(legacy.session.hasTrace).toBe(true);
+    expect(legacy.session.tracePath).toBeUndefined();
+
+    const journal = await writeLogicalTraceJournal(
+      t.root,
+      projectId,
+      "default_agent",
+      session.sessionId,
+      [
+        {
+          record_type: "session_fact",
+          protocol_version: 3,
+          timestamp: "2026-07-03T00:00:00.000Z",
+          message: sessionMeta(meta),
+        },
+      ],
+    );
     const after = (await (
       await api.get(`/api/sessions/${session.sessionId}`)
     ).json()) as SessionResponse;
-    // The /model switch block hands this to the model: it must point at the latest shard.
-    expect(after.session.tracePath?.endsWith(`${session.sessionId}_002.jsonl`)).toBe(true);
+    // The /model switch consumes the whole resumable bundle, not a journal or one root file.
+    expect(after.session.tracePath).toBe(path.dirname(journal));
     // List rows omit it (locating it would cost a directory walk per row).
     const list = (await (await api.get(base())).json()) as SessionsResponse;
     expect(list.sessions.find((s) => s.sessionId === session.sessionId)?.tracePath).toBeUndefined();

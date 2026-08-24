@@ -13,7 +13,7 @@
  *     list honors, applied server-side to rows, counts and workspace groups alike.
  *     The listing consults the sessions table read-only (titles, archived, workspace,
  *     client); discovery itself still comes from the Trace directory tree via the index.
- *   - GET /api/projects/:p/agents/:a/traces/:sessionId/:index (including /analysis, /download) —
+ *   - GET /api/projects/:p/agents/:a/traces/:sessionId/:index (including /analysis, /download, /turns) —
  *     read-only Trace detail endpoints (FD-3): locate the Trace file directly by
  *     (projectId, agentId, sessionId), without depending on the sessions table for
  *     tracking — any entry visible in the directory tree (subagent child Sessions,
@@ -80,6 +80,42 @@ export function agentTracesRoutes(deps: AppDeps): Hono<AppEnv> {
         ...(rawCli !== undefined ? { includeCli: true } : {}),
       }),
     );
+  });
+
+  app.get("/:sessionId/roots", async (c) => {
+    const projectId = requireValidId(c, "projectId");
+    const agentId = requireValidId(c, "agentId");
+    const sessionId = requireValidId(c, "sessionId");
+    deps.projectService.requireProjectAccess(c.var.user.userId, projectId);
+    return c.json(await deps.traceService.readRoots(projectId, agentId, sessionId));
+  });
+
+  app.get("/:sessionId/roots/:traceId", async (c) => {
+    const projectId = requireValidId(c, "projectId");
+    const agentId = requireValidId(c, "agentId");
+    const sessionId = requireValidId(c, "sessionId");
+    const traceId = requireValidId(c, "traceId");
+    deps.projectService.requireProjectAccess(c.var.user.userId, projectId);
+    return c.json(await deps.traceService.readRoot(projectId, agentId, sessionId, traceId));
+  });
+
+  app.get("/:sessionId/:index/turns", async (c) => {
+    const projectId = requireValidId(c, "projectId");
+    const agentId = requireValidId(c, "agentId");
+    const sessionId = requireValidId(c, "sessionId");
+    deps.projectService.requireProjectAccess(c.var.user.userId, projectId);
+    const index = positiveIntParam(c, "index");
+    return c.json(await deps.traceService.readTurns(projectId, agentId, sessionId, index));
+  });
+
+  app.get("/:sessionId/:index/turns/:turnId", async (c) => {
+    const projectId = requireValidId(c, "projectId");
+    const agentId = requireValidId(c, "agentId");
+    const sessionId = requireValidId(c, "sessionId");
+    const turnId = requireValidId(c, "turnId");
+    deps.projectService.requireProjectAccess(c.var.user.userId, projectId);
+    const index = positiveIntParam(c, "index");
+    return c.json(await deps.traceService.readTurn(projectId, agentId, sessionId, index, turnId));
   });
 
   app.get("/:sessionId/:index", async (c) => {

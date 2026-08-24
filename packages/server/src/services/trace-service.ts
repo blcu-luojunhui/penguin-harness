@@ -31,10 +31,23 @@ import type {
   TraceEventsResponse,
   TraceFileInfo,
   TraceImportResponse,
+  TraceHistoryDiagnostic,
+  TraceHistoryInfo,
   TraceModelSegment,
   TraceOtherSpan,
+  TraceRootKind,
+  TraceRootResponse,
+  TraceRootSubagent,
+  TraceRootsResponse,
+  TraceRootSummary,
+  TraceStepSummary,
+  TraceTaskSummary,
   TraceTaskStats,
   TraceToolSpan,
+  TraceTurnResponse,
+  TraceTurnSubagent,
+  TraceTurnsResponse,
+  TraceTurnSummary,
   UsageTrendPointInTrace,
 } from "../api/types.js";
 import type { SessionRow } from "../db/repos/sessions.js";
@@ -79,6 +92,444 @@ interface LocatedFile {
   sizeBytes: number;
 }
 
+/**
+ * Runtime view of additive protocol-v2 fields; on-disk JSON is not runtime-validated by the
+ * parser. Server and Web maintainers keep this read-only shard path together until a release
+ * explicitly drops v1/v2 inspection after shipping a documented backup or bulk-export path.
+ * Removing the reader never authorizes deleting the legacy files themselves.
+ */
+function explicitTraceRecord(
+  message: OmniMessage,
+): { turnId: string; spanId?: string; payload: Record<string, unknown> } | null {
+  if (message.protocol_version !== 2 || message.trace === undefined) return null;
+  const legacyTrace = message.trace as unknown as { turn_id?: unknown; span_id?: unknown };
+  const turnId: unknown = legacyTrace.turn_id;
+  if (typeof turnId !== "string" || turnId.length === 0) return null;
+  const spanId: unknown = legacyTrace.span_id;
+  const payload = message.payload as unknown;
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return null;
+  return {
+    turnId,
+    ...(typeof spanId === "string" && spanId.length > 0 ? { spanId } : {}),
+    payload: payload as Record<string, unknown>,
+  };
+}
+
+/** Materializes only explicit `agent.turn` root Span lifecycles; it never infers V1 turns. */
+function explicitTurnSummaries(records: OmniMessage[]): TraceTurnsResponse {
+  const supported = records.some((message) => message.protocol_version === 2);
+  if (!supported) return { supported: false, protocolVersion: null, turns: [] };
+
+  const recordCounts = new Map<string, number>();
+  const byTurn = new Map<string, TraceTurnSummary>();
+  const rootEnds = new Map<string, { timestamp: string; status?: string }>();
+  const turns: TraceTurnSummary[] = [];
+  for (const message of records) {
+    const explicit = explicitTraceRecord(message);
+    if (explicit === null) continue;
+    recordCounts.set(explicit.turnId, (recordCounts.get(explicit.turnId) ?? 0) + 1);
+
+    if (message.type !== "event_msg") continue;
+    const lifecycleType = explicit.payload.type;
+    if (
+      lifecycleType === "span_begin" &&
+      explicit.payload.span_kind === "agent.turn" &&
+      explicit.spanId !== undefined &&
+      typeof message.timestamp === "string" &&
+      message.timestamp.length > 0 &&
+      !byTurn.has(explicit.turnId)
+    ) {
+      const summary: TraceTurnSummary = {
+        turnId: explicit.turnId,
+        rootSpanId: explicit.spanId,
+        startTs: message.timestamp,
+        recordCount: 0,
+      };
+      byTurn.set(explicit.turnId, summary);
+      turns.push(summary);
+      continue;
+    }
+
+    if (
+      lifecycleType !== "span_end" ||
+      explicit.payload.span_kind !== "agent.turn" ||
+      explicit.spanId === undefined
+    ) {
+      continue;
+    }
+    if (typeof message.timestamp !== "string" || message.timestamp.length === 0) continue;
+    const key = `${explicit.turnId}\u0000${explicit.spanId}`;
+    if (!rootEnds.has(key)) {
+      rootEnds.set(key, {
+        timestamp: message.timestamp,
+        ...(typeof explicit.payload.status === "string" ? { status: explicit.payload.status } : {}),
+      });
+    }
+  }
+  for (const turn of turns) {
+    turn.recordCount = recordCounts.get(turn.turnId) ?? 0;
+    const end = rootEnds.get(`${turn.turnId}\u0000${turn.rootSpanId}`);
+    if (end === undefined) continue;
+    turn.endTs = end.timestamp;
+    if (end.status !== undefined) turn.status = end.status;
+  }
+  return { supported: true, protocolVersion: 2, turns };
+}
+
+interface LogicalTraceLink {
+  traceId: string;
+  rootKind: TraceRootKind;
+  taskId?: string;
+}
+
+interface LogicalTraceEventLink {
+  traceId: string;
+  eventId: string;
+}
+
+interface LogicalHistoryPayload {
+  message: OmniMessage;
+  storedTraceId: string;
+  actualTraceId?: string;
+  eventId: string;
+  claimed: boolean;
+}
+
+interface ExplicitV3Record {
+  message: OmniMessage;
+  payload: Record<string, unknown>;
+  taskId?: string;
+  stepId?: string;
+  spanId?: string;
+}
+
+interface SpanTerminal {
+  spanId: string;
+  timestamp?: string;
+  status?: string;
+}
+
+interface SpanLifecycle {
+  begin?: { spanId: string; timestamp?: string };
+  firstEnd?: SpanTerminal;
+  ends: Map<string, SpanTerminal>;
+}
+
+interface StepAccumulator {
+  stepId: string;
+  taskId: string;
+  recordCount: number;
+  lifecycle: SpanLifecycle;
+}
+
+interface TaskAccumulator {
+  taskId: string;
+  recordCount: number;
+  lifecycle: SpanLifecycle;
+  steps: Map<string, StepAccumulator>;
+}
+
+interface ProjectedLogicalTrace {
+  root: TraceRootSummary;
+  tasks: TraceTaskSummary[];
+}
+
+interface LogicalHistorySegment {
+  /** Stable 1-based ordinal of the source record in the append-only Session journal. */
+  cursorIndex: number;
+  messages: OmniMessage[];
+}
+
+interface LogicalSessionHistory {
+  supported: boolean;
+  segments: LogicalHistorySegment[];
+  diagnostics: TraceHistoryDiagnostic[];
+}
+
+interface LogicalProjectedEvent {
+  /** 1-based physical line ordinal in session.jsonl. */
+  journalOrdinal: number;
+  traceId: string;
+  eventId: string;
+  message: OmniMessage;
+}
+
+interface LogicalJournalEntry {
+  /** 1-based physical line ordinal; malformed and empty lines still occupy ordinals. */
+  lineOrdinal: number;
+  value: OmniMessage;
+}
+
+interface LogicalSessionProjection {
+  supported: boolean;
+  journal: LogicalJournalEntry[];
+  links: LogicalTraceLink[];
+  events: LogicalProjectedEvent[];
+  diagnostics: TraceHistoryDiagnostic[];
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function rootKindOf(value: unknown): TraceRootKind | undefined {
+  return value === "goal_run" || value === "task" ? value : undefined;
+}
+
+function isMissingPath(error: unknown): boolean {
+  const code = asRecord(error)?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+/** Runtime validation for the protocol-v3 Session journal's append-only Trace links. */
+function logicalTraceLink(value: unknown, sessionId: string): LogicalTraceLink | null {
+  const record = asRecord(value);
+  if (
+    record === null ||
+    record.protocol_version !== 3 ||
+    record.record_type !== "trace_link" ||
+    record.session_id !== sessionId
+  ) {
+    return null;
+  }
+  const traceId = nonEmptyString(record.trace_id);
+  const rootKind = rootKindOf(record.root_kind);
+  if (traceId === undefined || rootKind === undefined || !IMPORT_SESSION_ID_RE.test(traceId)) {
+    return null;
+  }
+  const taskId = nonEmptyString(record.task_id);
+  return { traceId, rootKind, ...(taskId !== undefined ? { taskId } : {}) };
+}
+
+/** Runtime validation for the v3 journal's exact history-order links. */
+function logicalTraceEventLink(value: unknown, sessionId: string): LogicalTraceEventLink | null {
+  const record = asRecord(value);
+  if (
+    record === null ||
+    record.protocol_version !== 3 ||
+    record.record_type !== "trace_event_link" ||
+    record.session_id !== sessionId
+  ) {
+    return null;
+  }
+  const traceId = nonEmptyString(record.trace_id);
+  const eventId = nonEmptyString(record.event_id);
+  return traceId !== undefined &&
+    eventId !== undefined &&
+    IMPORT_SESSION_ID_RE.test(traceId) &&
+    IMPORT_SESSION_ID_RE.test(eventId)
+    ? { traceId, eventId }
+    : null;
+}
+
+/** Exact marker that opts a Session into journal-ordinal history reconstruction. */
+function isLogicalSessionFormat(value: unknown, sessionId: string): boolean {
+  const record = asRecord(value);
+  return (
+    record !== null &&
+    record.record_type === "session_format" &&
+    record.protocol_version === 3 &&
+    record.format === "penguin.trace.session" &&
+    record.format_version === 1 &&
+    record.session_id === sessionId
+  );
+}
+
+/** Runtime validation for a v3 journal-wrapped Session fact. */
+function logicalSessionFact(value: unknown): OmniMessage | null {
+  const record = asRecord(value);
+  if (record === null || record.protocol_version !== 3 || record.record_type !== "session_fact") {
+    return null;
+  }
+  const message = asRecord(record.message);
+  if (message === null) return null;
+  if (message.type === "session_meta") return message as unknown as OmniMessage;
+  const payload = asRecord(message.payload);
+  return message.type === "event_msg" && payload?.type === "tool_list_ready"
+    ? (message as unknown as OmniMessage)
+    : null;
+}
+
+/** Runtime view of one explicit protocol-v3 execution record for the requested root. */
+function explicitV3Record(message: OmniMessage, traceId: string): ExplicitV3Record | null {
+  const envelope = asRecord(message);
+  if (envelope === null || envelope.protocol_version !== 3) return null;
+  const trace = asRecord(envelope.trace);
+  const payload = asRecord(envelope.payload);
+  if (trace === null || payload === null || trace.trace_id !== traceId) return null;
+  const taskId = nonEmptyString(trace.task_id);
+  const stepId = nonEmptyString(trace.step_id);
+  const spanId = nonEmptyString(trace.span_id);
+  return {
+    message,
+    payload,
+    ...(taskId !== undefined ? { taskId } : {}),
+    ...(stepId !== undefined ? { stepId } : {}),
+    ...(spanId !== undefined ? { spanId } : {}),
+  };
+}
+
+function logicalHistoryPointerKey(message: OmniMessage): string | null {
+  const envelope = asRecord(message);
+  const payload = asRecord(envelope?.payload);
+  const trace = asRecord(envelope?.trace);
+  return envelope?.protocol_version === 3 &&
+    payload?.type === "subagent" &&
+    typeof payload.session_id === "string" &&
+    payload.session_id.length > 0 &&
+    typeof trace?.span_id === "string" &&
+    trace.span_id.length > 0
+    ? `${payload.session_id}\u0000${trace.span_id}`
+    : null;
+}
+
+function emptyLifecycle(): SpanLifecycle {
+  return { ends: new Map() };
+}
+
+function messageTimestamp(message: OmniMessage): string | undefined {
+  return nonEmptyString(asRecord(message)?.timestamp);
+}
+
+function noteSpanLifecycle(
+  lifecycle: SpanLifecycle,
+  record: ExplicitV3Record,
+  spanKind: "agent.task" | "agent.step",
+): void {
+  if (record.payload.span_kind !== spanKind || record.spanId === undefined) return;
+  const timestamp = messageTimestamp(record.message);
+  if (record.payload.type === "span_begin") {
+    if (lifecycle.begin === undefined) {
+      lifecycle.begin = {
+        spanId: record.spanId,
+        ...(timestamp !== undefined ? { timestamp } : {}),
+      };
+    }
+    return;
+  }
+  if (record.payload.type !== "span_end") return;
+  const terminal: SpanTerminal = {
+    spanId: record.spanId,
+    ...(timestamp !== undefined ? { timestamp } : {}),
+    ...(typeof record.payload.status === "string" ? { status: record.payload.status } : {}),
+  };
+  if (lifecycle.firstEnd === undefined) lifecycle.firstEnd = terminal;
+  if (!lifecycle.ends.has(record.spanId)) lifecycle.ends.set(record.spanId, terminal);
+}
+
+function materializeStep(step: StepAccumulator): TraceStepSummary {
+  const spanId = step.lifecycle.begin?.spanId ?? step.lifecycle.firstEnd?.spanId;
+  const end = spanId !== undefined ? step.lifecycle.ends.get(spanId) : undefined;
+  return {
+    stepId: step.stepId,
+    taskId: step.taskId,
+    ...(spanId !== undefined ? { spanId } : {}),
+    ...(step.lifecycle.begin?.timestamp !== undefined
+      ? { startTs: step.lifecycle.begin.timestamp }
+      : {}),
+    ...(end?.timestamp !== undefined ? { endTs: end.timestamp } : {}),
+    ...(end?.status !== undefined ? { status: end.status } : {}),
+    recordCount: step.recordCount,
+    partial: step.lifecycle.begin === undefined || end === undefined,
+  };
+}
+
+function materializeTask(task: TaskAccumulator): TraceTaskSummary {
+  const spanId = task.lifecycle.begin?.spanId ?? task.lifecycle.firstEnd?.spanId;
+  const end = spanId !== undefined ? task.lifecycle.ends.get(spanId) : undefined;
+  return {
+    taskId: task.taskId,
+    ...(spanId !== undefined ? { spanId } : {}),
+    ...(task.lifecycle.begin?.timestamp !== undefined
+      ? { startTs: task.lifecycle.begin.timestamp }
+      : {}),
+    ...(end?.timestamp !== undefined ? { endTs: end.timestamp } : {}),
+    ...(end?.status !== undefined ? { status: end.status } : {}),
+    recordCount: task.recordCount,
+    partial: task.lifecycle.begin === undefined || end === undefined,
+    steps: [...task.steps.values()].map(materializeStep),
+  };
+}
+
+/** Projects one events.jsonl in append order; no timestamp or free-text inference is used. */
+function projectLogicalTrace(
+  link: LogicalTraceLink,
+  records: ExplicitV3Record[],
+): ProjectedLogicalTrace {
+  let begin: { rootKind: TraceRootKind; timestamp?: string } | undefined;
+  const rootEnds = new Map<TraceRootKind, { timestamp?: string; status?: string }>();
+  let firstEnd: { rootKind: TraceRootKind; timestamp?: string; status?: string } | undefined;
+  const tasks = new Map<string, TaskAccumulator>();
+
+  const ensureTask = (taskId: string): TaskAccumulator => {
+    let task = tasks.get(taskId);
+    if (task === undefined) {
+      task = { taskId, recordCount: 0, lifecycle: emptyLifecycle(), steps: new Map() };
+      tasks.set(taskId, task);
+    }
+    return task;
+  };
+  if (link.taskId !== undefined) ensureTask(link.taskId);
+
+  for (const record of records) {
+    const rootKind = rootKindOf(record.payload.root_kind);
+    const timestamp = messageTimestamp(record.message);
+    if (record.payload.type === "trace_begin" && rootKind !== undefined && begin === undefined) {
+      begin = { rootKind, ...(timestamp !== undefined ? { timestamp } : {}) };
+    } else if (record.payload.type === "trace_end" && rootKind !== undefined) {
+      const terminal = {
+        rootKind,
+        ...(timestamp !== undefined ? { timestamp } : {}),
+        ...(typeof record.payload.status === "string" ? { status: record.payload.status } : {}),
+      };
+      if (firstEnd === undefined) firstEnd = terminal;
+      if (!rootEnds.has(rootKind)) rootEnds.set(rootKind, terminal);
+    }
+
+    if (record.taskId === undefined) continue;
+    const task = ensureTask(record.taskId);
+    task.recordCount += 1;
+    noteSpanLifecycle(task.lifecycle, record, "agent.task");
+    if (record.stepId === undefined) continue;
+    let step = task.steps.get(record.stepId);
+    if (step === undefined) {
+      step = {
+        stepId: record.stepId,
+        taskId: record.taskId,
+        recordCount: 0,
+        lifecycle: emptyLifecycle(),
+      };
+      task.steps.set(record.stepId, step);
+    }
+    step.recordCount += 1;
+    noteSpanLifecycle(step.lifecycle, record, "agent.step");
+  }
+
+  const rootKind = begin?.rootKind ?? link.rootKind ?? firstEnd?.rootKind ?? null;
+  const rootEnd = rootKind !== null ? rootEnds.get(rootKind) : undefined;
+  const projectedTasks = [...tasks.values()].map(materializeTask);
+  const inconsistentKind = begin !== undefined && begin.rootKind !== link.rootKind;
+  return {
+    root: {
+      traceId: link.traceId,
+      rootKind,
+      ...(begin?.timestamp !== undefined ? { startTs: begin.timestamp } : {}),
+      ...(rootEnd?.timestamp !== undefined ? { endTs: rootEnd.timestamp } : {}),
+      ...(rootEnd?.status !== undefined ? { status: rootEnd.status } : {}),
+      recordCount: records.length,
+      taskCount: projectedTasks.length,
+      partial: begin === undefined || rootEnd === undefined || inconsistentKind,
+    },
+    tasks: projectedTasks,
+  };
+}
+
 /** A windowed history read's request shape (see readMessagesPage). */
 export type MessagesPageRequest =
   { kind: "tail"; limit: number } | { kind: "before"; cursor: MessageCursor; limit: number };
@@ -90,6 +541,14 @@ export interface MessagesPageResult {
   before?: string;
   /** Cumulative stats before the window (earlierTurns = prior.turns). */
   prior: WindowPriorStats;
+  /** Present when this expanded window touched protocol-v3 storage. */
+  history?: TraceHistoryInfo;
+}
+
+export interface MessagesReadResult {
+  messages: OmniMessage[];
+  /** Present when this expanded transcript touched protocol-v3 storage. */
+  history?: TraceHistoryInfo;
 }
 
 /**
@@ -103,6 +562,20 @@ interface ExpandCtx {
   ancestry: Set<string>;
   depth: number;
   raw: Map<string, OmniMessage[] | null>;
+  logicalHistorySeen: boolean;
+  diagnostics: TraceHistoryDiagnostic[];
+}
+
+function noteLogicalHistory(ctx: ExpandCtx, history: LogicalSessionHistory): void {
+  if (!history.supported) return;
+  ctx.logicalHistorySeen = true;
+  ctx.diagnostics.push(...history.diagnostics);
+}
+
+function historyInfo(ctx: ExpandCtx): TraceHistoryInfo | undefined {
+  return ctx.logicalHistorySeen
+    ? { protocolVersion: 3, partial: ctx.diagnostics.length > 0, diagnostics: ctx.diagnostics }
+    : undefined;
 }
 
 /**
@@ -157,6 +630,430 @@ export class TraceService {
     private readonly deps: TraceServiceDeps,
   ) {}
 
+  private logicalSessionDir(projectId: string, agentId: string, sessionId: string): string {
+    return path.join(tracesDir(this.root, projectId, agentId), sessionId);
+  }
+
+  /** Reads one optional v3 JSONL file with the Trace reader's torn-tail/malformed-line policy. */
+  private async readOptionalLogicalFile(file: string): Promise<OmniMessage[]> {
+    return (await this.readOptionalLogicalFileState(file)).records;
+  }
+
+  /** Same read with ENOENT preserved so a journaled root can diagnose a missing file. */
+  private async readOptionalLogicalFileState(
+    file: string,
+  ): Promise<{ exists: boolean; records: OmniMessage[] }> {
+    try {
+      const records = await readTraceTolerant(file);
+      this.deps.observeShardRead?.(file);
+      return { exists: true, records };
+    } catch (error) {
+      if (isMissingPath(error)) return { exists: false, records: [] };
+      throw error;
+    }
+  }
+
+  /**
+   * Reads session.jsonl without compacting away malformed physical lines. Journal line
+   * ordinals are wire cursors, so a tolerant parser that returns only valid values would
+   * make cursors drift after corruption.
+   */
+  private async readLogicalSessionJournalFile(
+    projectId: string,
+    agentId: string,
+    sessionId: string,
+  ): Promise<{ entries: LogicalJournalEntry[]; diagnostics: TraceHistoryDiagnostic[] }> {
+    const file = path.join(this.logicalSessionDir(projectId, agentId, sessionId), "session.jsonl");
+    let content: string;
+    try {
+      content = await fs.readFile(file, "utf8");
+      this.deps.observeShardRead?.(file);
+    } catch (error) {
+      if (isMissingPath(error)) return { entries: [], diagnostics: [] };
+      throw error;
+    }
+
+    const entries: LogicalJournalEntry[] = [];
+    const diagnostics: TraceHistoryDiagnostic[] = [];
+    const lines = content.split("\n");
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+      const line = lines[lineIndex]!;
+      if (line.trim().length === 0) continue;
+      try {
+        entries.push({
+          lineOrdinal: lineIndex + 1,
+          value: JSON.parse(line) as OmniMessage,
+        });
+      } catch {
+        diagnostics.push({
+          code: "malformed_session_journal",
+          sessionId,
+          journalIndex: lineIndex,
+          message: `Session history journal line ${lineIndex + 1} is malformed or crash-torn and was skipped.`,
+        });
+      }
+    }
+    return { entries, diagnostics };
+  }
+
+  /**
+   * Matches protocol-v3 payloads onto first-winning Session-journal event links. This
+   * projector is the only ordering source for both chat history and logical-root APIs.
+   */
+  private async readLogicalSessionProjection(
+    projectId: string,
+    agentId: string,
+    sessionId: string,
+  ): Promise<LogicalSessionProjection> {
+    const parsedJournal = await this.readLogicalSessionJournalFile(projectId, agentId, sessionId);
+    const journal = parsedJournal.entries;
+    const supported = journal.some((entry) => asRecord(entry.value)?.protocol_version === 3);
+    if (!supported) {
+      if (parsedJournal.diagnostics.length > 0) {
+        throw new HttpError(
+          409,
+          "trace_history_unsupported",
+          "This Session journal has no readable protocol-v3 format marker and cannot be reconstructed safely.",
+        );
+      }
+      return { supported: false, journal, links: [], events: [], diagnostics: [] };
+    }
+    if (!journal.some((entry) => isLogicalSessionFormat(entry.value, sessionId))) {
+      throw new HttpError(
+        409,
+        "trace_history_unsupported",
+        "This protocol-v3 Session predates explicit history-order links and cannot be reconstructed safely.",
+      );
+    }
+
+    const links: LogicalTraceLink[] = [];
+    const seenLinks = new Set<string>();
+    const traceIds: string[] = [];
+    const seenTraceIds = new Set<string>();
+    for (const entry of journal) {
+      const source = entry.value;
+      const rootLink = logicalTraceLink(source, sessionId);
+      if (rootLink !== null && !seenLinks.has(rootLink.traceId)) {
+        seenLinks.add(rootLink.traceId);
+        links.push(rootLink);
+      }
+      const traceId = rootLink?.traceId ?? logicalTraceEventLink(source, sessionId)?.traceId;
+      if (traceId === undefined || seenTraceIds.has(traceId)) continue;
+      seenTraceIds.add(traceId);
+      traceIds.push(traceId);
+    }
+
+    const diagnostics: TraceHistoryDiagnostic[] = [...parsedJournal.diagnostics];
+    const payloadDiagnostics: TraceHistoryDiagnostic[] = [];
+    const payloads = new Map<string, LogicalHistoryPayload[]>();
+    const allPayloads: LogicalHistoryPayload[] = [];
+    const tracePayloadFiles = await Promise.all(
+      traceIds.map((storedTraceId) =>
+        this.readOptionalLogicalFileState(
+          path.join(
+            this.logicalSessionDir(projectId, agentId, sessionId),
+            "traces",
+            storedTraceId,
+            "events.jsonl",
+          ),
+        ),
+      ),
+    );
+    for (let traceIndex = 0; traceIndex < traceIds.length; traceIndex += 1) {
+      const storedTraceId = traceIds[traceIndex]!;
+      const payloadFile = tracePayloadFiles[traceIndex]!;
+      if (!payloadFile.exists && seenLinks.has(storedTraceId)) {
+        payloadDiagnostics.push({
+          code: "missing_trace_event_file",
+          sessionId,
+          traceId: storedTraceId,
+          message: `Trace ${storedTraceId} is linked from the Session journal, but its events.jsonl file is missing.`,
+        });
+      }
+      const raw = payloadFile.records;
+      for (const message of raw) {
+        const envelope = asRecord(message);
+        if (envelope?.protocol_version !== 3) continue;
+        const eventId = nonEmptyString(envelope.event_id);
+        const actualTraceId = nonEmptyString(asRecord(envelope.trace)?.trace_id);
+        if (eventId === undefined) {
+          payloadDiagnostics.push({
+            code: "unlinked_trace_event",
+            sessionId,
+            traceId: storedTraceId,
+            message: `A protocol-v3 event in Trace ${storedTraceId} has no event_id and cannot be linked into Session history.`,
+          });
+          continue;
+        }
+        const payload: LogicalHistoryPayload = {
+          message,
+          storedTraceId,
+          ...(actualTraceId !== undefined ? { actualTraceId } : {}),
+          eventId,
+          claimed: false,
+        };
+        const key = `${storedTraceId}\u0000${eventId}`;
+        const bucket = payloads.get(key);
+        if (bucket === undefined) payloads.set(key, [payload]);
+        else bucket.push(payload);
+        allPayloads.push(payload);
+      }
+    }
+
+    const events: LogicalProjectedEvent[] = [];
+    const seenEventLinks = new Set<string>();
+    for (const entry of journal) {
+      const source = entry.value;
+      const link = logicalTraceEventLink(source, sessionId);
+      if (link === null) continue;
+      const key = `${link.traceId}\u0000${link.eventId}`;
+      if (seenEventLinks.has(key)) {
+        diagnostics.push({
+          code: "duplicate_trace_event_link",
+          sessionId,
+          journalIndex: entry.lineOrdinal - 1,
+          traceId: link.traceId,
+          eventId: link.eventId,
+          message: `Session history has more than one link for event ${link.eventId} in Trace ${link.traceId}; the first link wins.`,
+        });
+        continue;
+      }
+      seenEventLinks.add(key);
+
+      const payload = payloads.get(key)?.[0];
+      if (payload === undefined) {
+        diagnostics.push({
+          code: "dangling_trace_event_link",
+          sessionId,
+          journalIndex: entry.lineOrdinal - 1,
+          traceId: link.traceId,
+          eventId: link.eventId,
+          message: `Session history links event ${link.eventId} in Trace ${link.traceId}, but its payload is missing.`,
+        });
+        continue;
+      }
+      payload.claimed = true;
+      if (payload.actualTraceId !== link.traceId) {
+        diagnostics.push({
+          code: "trace_event_mismatch",
+          sessionId,
+          journalIndex: entry.lineOrdinal - 1,
+          traceId: link.traceId,
+          eventId: link.eventId,
+          message: `Linked event ${link.eventId} belongs to Trace ${payload.actualTraceId ?? "<missing>"}, not Trace ${link.traceId}.`,
+        });
+        continue;
+      }
+      events.push({
+        journalOrdinal: entry.lineOrdinal,
+        traceId: link.traceId,
+        eventId: link.eventId,
+        message: payload.message,
+      });
+    }
+
+    for (const payload of allPayloads) {
+      if (payload.claimed) continue;
+      payloadDiagnostics.push({
+        code: "unlinked_trace_event",
+        sessionId,
+        traceId: payload.storedTraceId,
+        eventId: payload.eventId,
+        message: `Event ${payload.eventId} in Trace ${payload.storedTraceId} has no first-winning Session history link.`,
+      });
+    }
+    diagnostics.push(...payloadDiagnostics);
+    diagnostics.sort(
+      (left, right) =>
+        (left.journalIndex ?? Number.MAX_SAFE_INTEGER) -
+        (right.journalIndex ?? Number.MAX_SAFE_INTEGER),
+    );
+    return { supported: true, journal, links, events, diagnostics };
+  }
+
+  /** Materializes the chat transcript from the shared journal-link projection. */
+  private async readLogicalSessionHistory(
+    projectId: string,
+    agentId: string,
+    sessionId: string,
+  ): Promise<LogicalSessionHistory> {
+    const projection = await this.readLogicalSessionProjection(projectId, agentId, sessionId);
+    if (!projection.supported) {
+      return { supported: false, segments: [], diagnostics: [] };
+    }
+
+    const events = new Map(
+      projection.events.map((event) => [event.journalOrdinal, event.message] as const),
+    );
+    const segments: LogicalHistorySegment[] = [];
+    const seenPointers = new Set<string>();
+    for (const entry of projection.journal) {
+      const fact = logicalSessionFact(entry.value);
+      if (fact !== null) {
+        const payload = asRecord(fact.payload);
+        if (
+          fact.type !== "session_meta" ||
+          (payload !== null && payload.session_id === sessionId)
+        ) {
+          segments.push({ cursorIndex: entry.lineOrdinal, messages: [fact] });
+        }
+        continue;
+      }
+      const message = events.get(entry.lineOrdinal);
+      if (message === undefined) continue;
+      const pointerKey = logicalHistoryPointerKey(message);
+      if (pointerKey !== null) {
+        if (seenPointers.has(pointerKey)) continue;
+        seenPointers.add(pointerKey);
+      }
+      segments.push({ cursorIndex: entry.lineOrdinal, messages: [message] });
+    }
+    return {
+      supported: true,
+      segments,
+      diagnostics: projection.diagnostics,
+    };
+  }
+
+  /** Selects one root from the shared journal-link projection. */
+  private logicalTraceRecords(
+    projection: LogicalSessionProjection,
+    traceId: string,
+  ): { raw: OmniMessage[]; explicit: ExplicitV3Record[] } {
+    const raw = projection.events
+      .filter((event) => event.traceId === traceId)
+      .map((event) => event.message);
+    const explicit: ExplicitV3Record[] = [];
+    for (const message of raw) {
+      const record = explicitV3Record(message, traceId);
+      if (record !== null) explicit.push(record);
+    }
+    return { raw: explicit.map((record) => record.message), explicit };
+  }
+
+  /** Resolves a child Session through the unified legacy/v3 Session index. */
+  private async resolveLogicalChildAgent(
+    projectId: string,
+    sessionId: string,
+    ctx: { projectScanned: boolean },
+  ): Promise<string | null> {
+    return this.resolveChildAgent(projectId, sessionId, ctx);
+  }
+
+  private async logicalTraceSubagents(
+    projectId: string,
+    records: ExplicitV3Record[],
+  ): Promise<TraceRootSubagent[]> {
+    const subagents: TraceRootSubagent[] = [];
+    const positions = new Map<string, number>();
+    for (const record of records) {
+      if (record.payload.type !== "subagent") continue;
+      const sessionId = nonEmptyString(record.payload.session_id);
+      if (sessionId === undefined) continue;
+      const envelope = asRecord(record.message)!;
+      const eventId = nonEmptyString(envelope.event_id);
+      const childTraceId = nonEmptyString(record.payload.trace_id);
+      const childTaskId = nonEmptyString(record.payload.task_id);
+      const key = `${sessionId}\u0000${record.spanId ?? ""}`;
+      const existingPosition = positions.get(key);
+      if (existingPosition === undefined) {
+        positions.set(key, subagents.length);
+        subagents.push({
+          sessionId,
+          ...(childTraceId !== undefined ? { childTraceId } : {}),
+          ...(childTaskId !== undefined ? { childTaskId } : {}),
+          ...(record.spanId !== undefined ? { invocationSpanId: record.spanId } : {}),
+          ...(eventId !== undefined ? { eventId } : {}),
+        });
+        continue;
+      }
+      const existing = subagents[existingPosition]!;
+      // Core may first record a session-only pointer and append a refined pointer once
+      // the child trace_begin arrives. Preserve the invocation's first position while
+      // replacing its navigation target with the most precise later record.
+      if (childTraceId !== undefined) existing.childTraceId = childTraceId;
+      if (childTaskId !== undefined) existing.childTaskId = childTaskId;
+      if (eventId !== undefined && (childTraceId !== undefined || existing.eventId === undefined)) {
+        existing.eventId = eventId;
+      }
+    }
+
+    const resolved = new Map<string, string | null>();
+    const resolveCtx = { projectScanned: false };
+    for (const subagent of subagents) {
+      let agentId = resolved.get(subagent.sessionId);
+      if (agentId === undefined) {
+        agentId = await this.resolveLogicalChildAgent(projectId, subagent.sessionId, resolveCtx);
+        resolved.set(subagent.sessionId, agentId);
+      }
+      if (agentId !== null) subagent.agentId = agentId;
+    }
+    return subagents;
+  }
+
+  /** Lists protocol-v3 logical roots in Session-journal order; V1/v2 is never inferred. */
+  async readRoots(
+    projectId: string,
+    agentId: string,
+    sessionId: string,
+  ): Promise<TraceRootsResponse> {
+    const projection = await this.readLogicalSessionProjection(projectId, agentId, sessionId);
+    if (!projection.supported) {
+      return { supported: false, protocolVersion: null, roots: [] };
+    }
+    const roots: TraceRootSummary[] = [];
+    for (const link of projection.links) {
+      const records = this.logicalTraceRecords(projection, link.traceId);
+      const root = projectLogicalTrace(link, records.explicit).root;
+      if (
+        projection.diagnostics.some(
+          (diagnostic) => diagnostic.traceId === undefined || diagnostic.traceId === link.traceId,
+        )
+      ) {
+        root.partial = true;
+      }
+      roots.push(root);
+    }
+    return {
+      supported: true,
+      protocolVersion: 3,
+      roots,
+      ...(projection.diagnostics.length > 0 ? { diagnostics: projection.diagnostics } : {}),
+    };
+  }
+
+  /** Reads one Session-scoped logical root and its explicit Tasks, records, and child links. */
+  async readRoot(
+    projectId: string,
+    agentId: string,
+    sessionId: string,
+    traceId: string,
+  ): Promise<TraceRootResponse> {
+    const projection = await this.readLogicalSessionProjection(projectId, agentId, sessionId);
+    const link = projection.links.find((candidate) => candidate.traceId === traceId);
+    if (!projection.supported || link === undefined) {
+      throw new HttpError(
+        404,
+        "trace_root_not_found",
+        `This Session has no explicit protocol-v3 Trace root with id ${traceId}.`,
+      );
+    }
+    const records = this.logicalTraceRecords(projection, traceId);
+    const projected = projectLogicalTrace(link, records.explicit);
+    const diagnostics = projection.diagnostics.filter(
+      (diagnostic) => diagnostic.traceId === undefined || diagnostic.traceId === traceId,
+    );
+    if (diagnostics.length > 0) projected.root.partial = true;
+    return {
+      protocolVersion: 3,
+      root: projected.root,
+      tasks: projected.tasks,
+      records: records.raw,
+      subagents: await this.logicalTraceSubagents(projectId, records.explicit),
+      ...(diagnostics.length > 0 ? { diagnostics } : {}),
+    };
+  }
+
   /**
    * All of this Session's Trace files (sorted by index ascending), served from the
    * index. An empty answer force-reconciles once and retries before being believed:
@@ -190,12 +1087,16 @@ export class TraceService {
     return readTraceTolerant(path);
   }
 
-  /** Deletes all of this Session's Trace files (called when the Session is deleted); the index rows go with them. */
+  /** Deletes this Session's legacy shards and protocol-v3 bundle; the index rows go with them. */
   async deleteSessionTraces(projectId: string, agentId: string, sessionId: string): Promise<void> {
     const files = await this.locateAll(projectId, agentId, sessionId);
     for (const file of files) {
       await fs.rm(file.path, { force: true });
     }
+    await fs.rm(path.join(tracesDir(this.root, projectId, agentId), sessionId), {
+      recursive: true,
+      force: true,
+    });
     this.deps.index.removeSession(projectId, agentId, sessionId);
   }
 
@@ -215,23 +1116,45 @@ export class TraceService {
    * emitted; when the child Trace is missing (deleted), the pointer event is kept
    * so API consumers can still know it existed.
    */
-  async readMessages(
+  async readMessagesResult(
     projectId: string,
     agentId: string,
     sessionId: string,
-  ): Promise<OmniMessage[]> {
+  ): Promise<MessagesReadResult> {
     const ctx: ExpandCtx = {
       projectScanned: false,
       ancestry: new Set([sessionId]),
       depth: 0,
       raw: new Map(),
+      logicalHistorySeen: false,
+      diagnostics: [],
     };
+    const logical = await this.readLogicalSessionHistory(projectId, agentId, sessionId);
+    if (logical.supported) {
+      noteLogicalHistory(ctx, logical);
+      const messages = await this.expandMessages(
+        projectId,
+        logical.segments.flatMap((segment) => segment.messages),
+        ctx,
+      );
+      return { messages, history: historyInfo(ctx)! };
+    }
     const files = await this.locateAll(projectId, agentId, sessionId);
     const out: OmniMessage[] = [];
     for (const file of files) {
       out.push(...(await this.expandMessages(projectId, await this.readShard(file.path), ctx)));
     }
-    return out;
+    const history = historyInfo(ctx);
+    return { messages: out, ...(history !== undefined ? { history } : {}) };
+  }
+
+  /** Backward-compatible service helper for callers that only consume message payloads. */
+  async readMessages(
+    projectId: string,
+    agentId: string,
+    sessionId: string,
+  ): Promise<OmniMessage[]> {
+    return (await this.readMessagesResult(projectId, agentId, sessionId)).messages;
   }
 
   /**
@@ -253,7 +1176,7 @@ export class TraceService {
     return this.deps.index.repo.findAgentBySession(projectId, childSid);
   }
 
-  /** A child session's concatenated raw shard messages, memoized per request; null = no Trace located. */
+  /** A child Session's v3 transcript or legacy shards, memoized per request. */
   private async readChildRaw(
     projectId: string,
     childSid: string,
@@ -264,10 +1187,16 @@ export class TraceService {
     const childAgent = await this.resolveChildAgent(projectId, childSid, ctx);
     let raw: OmniMessage[] | null = null;
     if (childAgent) {
-      const files = await this.locateAll(projectId, childAgent, childSid);
-      if (files.length > 0) {
-        raw = [];
-        for (const file of files) raw.push(...(await this.readShard(file.path)));
+      const logical = await this.readLogicalSessionHistory(projectId, childAgent, childSid);
+      if (logical.supported) {
+        noteLogicalHistory(ctx, logical);
+        raw = logical.segments.flatMap((segment) => segment.messages);
+      } else {
+        const files = await this.locateAll(projectId, childAgent, childSid);
+        if (files.length > 0) {
+          raw = [];
+          for (const file of files) raw.push(...(await this.readShard(file.path)));
+        }
       }
     }
     ctx.raw.set(childSid, raw);
@@ -402,6 +1331,119 @@ export class TraceService {
   }
 
   /**
+   * Correctness-first v3 paging. Cursor `fileIndex` is the 1-based source-record
+   * ordinal in session.jsonl, preserving the existing numeric `<index>:<ordinal>` wire
+   * shape while remaining stable under append-only journal growth.
+   */
+  private async readLogicalMessagesPage(
+    projectId: string,
+    sessionId: string,
+    history: LogicalSessionHistory,
+    req: MessagesPageRequest,
+  ): Promise<MessagesPageResult> {
+    const ctx: ExpandCtx = {
+      projectScanned: false,
+      ancestry: new Set([sessionId]),
+      depth: 0,
+      raw: new Map(),
+      logicalHistorySeen: false,
+      diagnostics: [],
+    };
+    noteLogicalHistory(ctx, history);
+    const empty = (): MessagesPageResult => ({
+      messages: [],
+      prior: initialScanState().totals,
+      history: historyInfo(ctx)!,
+    });
+    const segments = history.segments;
+    if (segments.length === 0) return empty();
+
+    let endPos: number;
+    let endOrdinal: number | null = null;
+    if (req.kind === "tail") {
+      endPos = segments.length - 1;
+    } else {
+      endPos = segments.findIndex((segment) => segment.cursorIndex === req.cursor.fileIndex);
+      if (endPos < 0) return empty();
+      endOrdinal = req.cursor.ordinal;
+    }
+
+    // v3 roots are appendable and have no trace_files cache rows. Replay prefix state
+    // from the explicit journal order for now; the child/raw memo keeps recursive reads
+    // bounded within this request.
+    const prefixes: ScanState[] = [];
+    for (let pos = 0; pos < endPos; pos += 1) {
+      const state = cloneScanState(pos === 0 ? initialScanState() : prefixes[pos - 1]!);
+      await scanMessages(
+        state,
+        segments[pos]!.messages,
+        () => {},
+        (sid) => this.aggregateChild(projectId, sid, ctx),
+      );
+      prefixes.push(state);
+    }
+
+    let boundaries: Array<{ pos: number; ordinal: number; stats: WindowPriorStats }> = [];
+    let startPos = endPos + 1;
+    while (boundaries.length <= req.limit && startPos > 0) {
+      startPos -= 1;
+      const messages = segments[startPos]!.messages;
+      const state = cloneScanState(startPos === 0 ? initialScanState() : prefixes[startPos - 1]!);
+      const segmentBoundaries: Array<{
+        pos: number;
+        ordinal: number;
+        stats: WindowPriorStats;
+      }> = [];
+      const to = startPos === endPos && endOrdinal !== null ? endOrdinal : messages.length;
+      await scanMessages(
+        state,
+        messages,
+        (ordinal, stats) => segmentBoundaries.push({ pos: startPos, ordinal, stats }),
+        (sid) => this.aggregateChild(projectId, sid, ctx),
+        0,
+        Math.min(to, messages.length),
+      );
+      boundaries = [...segmentBoundaries, ...boundaries];
+    }
+
+    let start: { pos: number; ordinal: number };
+    let before: string | undefined;
+    let prior: WindowPriorStats;
+    if (boundaries.length > req.limit) {
+      const boundary = boundaries[boundaries.length - req.limit]!;
+      start = { pos: boundary.pos, ordinal: boundary.ordinal };
+      before = encodeCursor({
+        fileIndex: segments[boundary.pos]!.cursorIndex,
+        ordinal: boundary.ordinal,
+      });
+      prior = boundary.stats;
+    } else {
+      start = { pos: 0, ordinal: 0 };
+      prior = initialScanState().totals;
+    }
+
+    const windowRaw: OmniMessage[] = [];
+    for (let pos = start.pos; pos <= endPos; pos += 1) {
+      const messages = segments[pos]!.messages;
+      const from = pos === start.pos ? start.ordinal : 0;
+      const to =
+        pos === endPos && endOrdinal !== null
+          ? Math.min(endOrdinal, messages.length)
+          : messages.length;
+      for (let ordinal = from; ordinal < to; ordinal += 1) {
+        windowRaw.push(messages[ordinal]!);
+      }
+    }
+    const expanded = await this.expandMessages(projectId, windowRaw, ctx);
+    return {
+      messages: expanded,
+      ...(before !== undefined ? { before } : {}),
+      prior,
+      history: historyInfo(ctx)!,
+    };
+  }
+
+  /**
    * Windowed history read (the `tailLimit` / `before` forms of GET /messages). The
    * window is a run of whole units — cut points and unit semantics live in
    * message-window.ts — assembled by reading ONLY the shards the window overlaps
@@ -415,17 +1457,24 @@ export class TraceService {
     sessionId: string,
     req: MessagesPageRequest,
   ): Promise<MessagesPageResult> {
-    const files = await this.locateAll(projectId, agentId, sessionId);
     const empty = (): MessagesPageResult => ({
       messages: [],
       prior: initialScanState().totals,
     });
+    const logical = await this.readLogicalSessionHistory(projectId, agentId, sessionId);
+    if (logical.supported) {
+      return this.readLogicalMessagesPage(projectId, sessionId, logical, req);
+    }
+
+    const files = await this.locateAll(projectId, agentId, sessionId);
     if (files.length === 0) return empty();
     const ctx: ExpandCtx = {
       projectScanned: false,
       ancestry: new Set([sessionId]),
       depth: 0,
       raw: new Map(),
+      logicalHistorySeen: false,
+      diagnostics: [],
     };
 
     // The window's exclusive end: the newest shard's end (tail), or the cursor (before).
@@ -493,7 +1542,13 @@ export class TraceService {
       for (let i = from; i < to; i++) windowRaw.push(messages[i]!);
     }
     const expanded = await this.expandMessages(projectId, windowRaw, ctx);
-    return { messages: expanded, ...(before !== undefined ? { before } : {}), prior };
+    const history = historyInfo(ctx);
+    return {
+      messages: expanded,
+      ...(before !== undefined ? { before } : {}),
+      prior,
+      ...(history !== undefined ? { history } : {}),
+    };
   }
 
   /** List of Trace files (index / date / size / mtime). */
@@ -531,6 +1586,58 @@ export class TraceService {
       offset,
       limit,
       total: messages.length,
+    };
+  }
+
+  /** Lists explicitly recorded ReAct Turns in one shard without applying legacy heuristics. */
+  async readTurns(
+    projectId: string,
+    agentId: string,
+    sessionId: string,
+    index: number,
+  ): Promise<TraceTurnsResponse> {
+    return explicitTurnSummaries(await this.readFileByIndex(projectId, agentId, sessionId, index));
+  }
+
+  /** Reads all protocol-v2 records for one explicitly recorded ReAct Turn. */
+  async readTurn(
+    projectId: string,
+    agentId: string,
+    sessionId: string,
+    index: number,
+    turnId: string,
+  ): Promise<TraceTurnResponse> {
+    const records = await this.readFileByIndex(projectId, agentId, sessionId, index);
+    const turn = explicitTurnSummaries(records).turns.find(
+      (candidate) => candidate.turnId === turnId,
+    );
+    if (turn === undefined) {
+      throw new HttpError(
+        404,
+        "trace_turn_not_found",
+        `This Trace file has no explicit Turn with id ${turnId}.`,
+      );
+    }
+    const turnRecords = records.filter(
+      (message) => explicitTraceRecord(message)?.turnId === turnId,
+    );
+    const subagents: TraceTurnSubagent[] = [];
+    const seenSubagents = new Set<string>();
+    const resolveCtx = { projectScanned: false };
+    for (const message of turnRecords) {
+      const childSessionId = subagentPointer(message);
+      if (childSessionId === null || seenSubagents.has(childSessionId)) continue;
+      seenSubagents.add(childSessionId);
+      const childAgentId = await this.resolveChildAgent(projectId, childSessionId, resolveCtx);
+      if (childAgentId !== null) {
+        subagents.push({ sessionId: childSessionId, agentId: childAgentId });
+      }
+    }
+    return {
+      protocolVersion: 2,
+      turn,
+      records: turnRecords,
+      subagents,
     };
   }
 
@@ -1109,7 +2216,11 @@ export class TraceService {
         (row.client === null || row.client === undefined || row.client === "web")
       );
     };
-    const ids = [...bySession.keys()].sort((a, b) => b.localeCompare(a));
+    // v3 Sessions deliberately have no trace_files rows. The paged inventory is the
+    // union of legacy shard groups and explicitly indexed Session bundles.
+    const ids = [...new Set([...bySession.keys(), ...factsBySession.keys()])].sort((a, b) =>
+      b.localeCompare(a),
+    );
     // Classify every group once; the same result drives the CLI/category filters, the
     // counts AND the returned fields, so a row can never appear in a bucket its own
     // `category` denies. Hidden CLI-origin groups are excluded from counts too.
@@ -1138,7 +2249,7 @@ export class TraceService {
     const page = filtered.slice(paging.offset, paging.offset + paging.limit);
     const sessions: AgentTraceSessionEntry[] = [];
     for (const sessionId of page) {
-      const shard = bySession.get(sessionId)!.sort((a, b) => a.fileIndex - b.fileIndex);
+      const shard = (bySession.get(sessionId) ?? []).sort((a, b) => a.fileIndex - b.fileIndex);
       // Fresh sizes for the returned page only (an actively-appended shard grows without
       // moving any directory mtime): bounded metadata stats, written back to the index.
       const withSize = await Promise.all(

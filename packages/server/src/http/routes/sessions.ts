@@ -459,9 +459,9 @@ export function sessionsRoutes(deps: AppDeps): Hono<AppEnv> {
     const row = resolveSession(c);
     const hasTrace = await deps.sessionService.hasTrace(row);
     const info = await deps.sessionService.toInfo(row, hasTrace);
-    // Single-session GET only: the latest Trace file's absolute path (a directory walk per
-    // call — too costly for list rows). The web's /model switch hands it to the new session's
-    // [model_switch_from] block so the model can read the source history itself.
+    // Single-session GET only: the protocol-v3 Session Trace bundle directory. The web's
+    // /model switch hands it to the new Session's [model_switch_from] block so the model can
+    // read the source history itself.
     const tracePath = hasTrace ? await deps.sessionService.latestTracePath(row) : undefined;
     return c.json({
       session: { ...info, ...(tracePath !== undefined ? { tracePath } : {}) },
@@ -687,17 +687,19 @@ export function sessionsRoutes(deps: AppDeps): Hono<AppEnv> {
       return c.json({
         messages: appendPendingInputs(result.messages, pendingInputs),
         ...(live !== undefined ? { live } : {}),
+        ...(result.history !== undefined ? { history: result.history } : {}),
         page: info,
       } satisfies MessagesResponse);
     }
-    const messages = await deps.traceService.readMessages(
+    const result = await deps.traceService.readMessagesResult(
       row.projectId,
       row.agentId,
       row.sessionId,
     );
     return c.json({
-      messages: appendPendingInputs(messages, pendingInputs),
+      messages: appendPendingInputs(result.messages, pendingInputs),
       ...(live !== undefined ? { live } : {}),
+      ...(result.history !== undefined ? { history: result.history } : {}),
     } satisfies MessagesResponse);
   });
 
@@ -1114,6 +1116,36 @@ export function sessionsRoutes(deps: AppDeps): Hono<AppEnv> {
     const row = resolveSession(c);
     const files = await deps.traceService.listTraceFiles(row.projectId, row.agentId, row.sessionId);
     return c.json({ files });
+  });
+
+  app.get("/:sessionId/traces/roots", async (c) => {
+    const row = resolveSession(c);
+    return c.json(await deps.traceService.readRoots(row.projectId, row.agentId, row.sessionId));
+  });
+
+  app.get("/:sessionId/traces/roots/:traceId", async (c) => {
+    const row = resolveSession(c);
+    const traceId = requireValidId(c, "traceId");
+    return c.json(
+      await deps.traceService.readRoot(row.projectId, row.agentId, row.sessionId, traceId),
+    );
+  });
+
+  app.get("/:sessionId/traces/:index/turns", async (c) => {
+    const row = resolveSession(c);
+    const index = positiveIntParam(c, "index");
+    return c.json(
+      await deps.traceService.readTurns(row.projectId, row.agentId, row.sessionId, index),
+    );
+  });
+
+  app.get("/:sessionId/traces/:index/turns/:turnId", async (c) => {
+    const row = resolveSession(c);
+    const index = positiveIntParam(c, "index");
+    const turnId = requireValidId(c, "turnId");
+    return c.json(
+      await deps.traceService.readTurn(row.projectId, row.agentId, row.sessionId, index, turnId),
+    );
   });
 
   app.get("/:sessionId/traces/:index", async (c) => {

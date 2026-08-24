@@ -366,16 +366,19 @@ export function finalizeScan(state: ScanState): void {
 // Cursor encoding
 // ---------------------------------------------------------------------------
 
-/** A window cursor: shard file index + message ordinal within that shard's parsed array. */
+/**
+ * A window cursor: legacy shard index or v3 Session-journal record ordinal, plus the
+ * message ordinal within that source's parsed array. Both sources are append-stable.
+ */
 export interface MessageCursor {
   fileIndex: number;
   ordinal: number;
 }
 
 /**
- * `<fileIndex>:<ordinal>` — stable across requests and compaction: rotation always
- * opens a NEW shard, closed shards are immutable, and the active shard is append-only,
- * so a (shard, ordinal) pair never moves.
+ * `<fileIndex>:<ordinal>` — stable across requests and compaction. Legacy uses an
+ * immutable/append-only shard index; v3 uses the append-only Session journal record's
+ * 1-based ordinal while `ordinal` addresses the linked root's append-only event array.
  */
 export function encodeCursor(c: MessageCursor): string {
   return `${c.fileIndex}:${c.ordinal}`;

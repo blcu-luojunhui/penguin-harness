@@ -167,12 +167,29 @@ On Session creation, `modelId` and `provider` are both-or-neither: send the comp
 | GET | /usage | Usage statistics; query parameters `from`, `to`, `groupBy`, `agentId`, `provider`, `modelId` |
 | GET | /usage/errors | One page of the error detail table (newest first): `offset`, `limit`, plus the same `from` / `to` / `agentId` filter → `{items, total}` |
 | GET | /agents/:agentId/traces | Date → Session drill-down structure of Trace files |
+| GET | /agents/:agentId/traces/:sessionId/roots | List protocol-v3 logical Trace roots across the Session |
+| GET | /agents/:agentId/traces/:sessionId/roots/:traceId | Read one v3 Goal Run or standalone Task root, including Tasks, Steps, records and subagent links |
 | GET | /agents/:agentId/traces/:sessionId/:index | Read Trace events (`offset` / `limit` pagination) |
+| GET | /agents/:agentId/traces/:sessionId/:index/turns | Legacy: list explicit protocol-v2 ReAct Turns in one physical shard |
+| GET | /agents/:agentId/traces/:sessionId/:index/turns/:turnId | Legacy: read one v2 Turn's explicit records and subagent navigation targets |
 | GET | /agents/:agentId/traces/:sessionId/:index/analysis | Trace performance analysis |
 | GET | /agents/:agentId/traces/:sessionId/:index/download | Download the raw Trace file (JSONL attachment) |
 | POST | /agents/:agentId/traces/import | Import a Trace file: `{dataBase64}` → `{sessionId, index, date}` |
 
 Trace download is available to any member; import is owner-only (like the Agent snapshot import, capped at 14MB). An imported file must be valid Trace JSONL whose first record is a `session_meta` with a filename-safe `session_id`; a session id the Agent already has is rejected (409 `trace_session_exists`), so an imported file always becomes index 001 of a new Session, landing in the local date directory of its first record's timestamp.
+
+The root endpoints are Session-scoped because a logical Trace is independent of physical JSONL
+shards. They consume only explicit protocol-v3 `trace_begin` / `trace_end`, `agent.task`, and
+`agent.step` lifecycles. Inventory returns `{supported:false, protocolVersion:null, roots:[]}` for
+V1/v2-only Sessions rather than guessing Goal or Task boundaries; detail returns 404
+`trace_root_not_found` when that explicit root does not exist. A v3 detail response is
+`{protocolVersion:3, root, tasks, records, subagents}`. Subagent links retain unresolved Session
+pointers and add `agentId`, `childTraceId`, or `childTaskId` only when explicitly available.
+
+The `/:index/turns` endpoints preserve their existing single-shard, protocol-v2 contract. They
+consume explicit `trace.turn_id` and `agent.turn` records and never infer semantics from
+`request_begin` / `request_end`. Their `supported` flag describes only that legacy shard; it is not
+a v3 root capability signal.
 
 ### Session-Level Endpoints
 
@@ -180,7 +197,7 @@ The paths below omit the `/api/sessions/:sessionId` prefix. For the storage mode
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | / | Session info (the single-session GET additionally carries `tracePath`, the absolute path of the latest Trace file; list rows omit it) |
+| GET | / | Session info (the single-session GET additionally carries `tracePath`, the absolute path of the v3 Session Trace bundle when present; list rows omit it) |
 | PATCH | / | Update: `{approvalMode?, thinkingLevel?, archived?, title?}`. `thinkingLevel` pins the level on this Session (durable): every later run that carries no level of its own uses it instead of the Agent config's, and it comes back as `SessionInfo.thinkingLevel` (absent = never pinned) |
 | DELETE | / | Delete the Session (along with its Traces and scratch files) |
 | GET | /messages | Full OmniMessage history; while a Task runs the response also carries `live` (the in-progress stream tail, see below) |
@@ -202,7 +219,11 @@ The paths below omit the `/api/sessions/:sessionId` prefix. For the storage mode
 | POST | /files/stat | Batch existence check: `{paths}` |
 | PUT | /files/content?path= | Upload a file: `{dataBase64}`, capped at 14MB |
 | GET | /traces | List this Session's Trace files |
+| GET | /traces/roots | List protocol-v3 logical Trace roots across the Session |
+| GET | /traces/roots/:traceId | Read one v3 logical Trace root with Tasks, Steps, records and subagent links |
 | GET | /traces/:index | Read Trace events (paginated) |
+| GET | /traces/:index/turns | Legacy: list explicit protocol-v2 ReAct Turns in one shard |
+| GET | /traces/:index/turns/:turnId | Legacy: read one v2 Turn's explicit records and subagent navigation targets |
 | GET | /traces/:index/analysis | Trace performance analysis |
 | GET | /scratchpad/:fileName | Read a session scratch file (e.g. input images, file attachments) |
 
@@ -288,7 +309,7 @@ interface ApprovalDecisionRequest {
 }
 ```
 
-The Web's `/model` switch has no dedicated endpoint: like the `/agent` handoff, it composes the ordinary APIs above — session creation opens a new Session for the same Agent (the chosen model, the source Workspace carried over), then POST /tasks sends a first message opening with a `[model_switch_from]` source block (the source session id, its `tracePath`, the Workspace, and the previous model pair); the model reads that Trace file itself when it needs the earlier history.
+The Web's `/model` switch has no dedicated endpoint: like the `/agent` handoff, it composes the ordinary APIs above — session creation opens a new Session for the same Agent (the chosen model, the source Workspace carried over), then POST /tasks sends a first message opening with a `[model_switch_from]` source block (the source session id, its `tracePath`, the Workspace, and the previous model pair); the model reads that Trace bundle itself when it needs the earlier history.
 
 ## Streaming (SSE)
 

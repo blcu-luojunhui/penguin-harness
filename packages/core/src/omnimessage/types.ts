@@ -31,7 +31,8 @@ export type Role = "user" | "assistant";
  *   - `aborted`: user-initiated interruption or cancellation;
  *   - `timeout`: LLM request timed out;
  *   - `malformed`: the LLM response was malformed (e.g. AgentHub JSON parsing exception).
- *     Only LLM timeout / malformed trigger a context_engine reconnect;
+ *     LLM failures other than `auth` (and explicitly permanent failures) may trigger a
+ *     context_engine reconnect; the status remains the observed failure category;
  *   - `auth`: the LLM rejected the credentials (see `isAuthenticationError`) — a
  *     `failed`-shaped stop that no in-run retry can fix; hosts disable input until the
  *     model's API key is updated (only the model reference is fixed at Session creation —
@@ -56,6 +57,25 @@ export type StreamEventType = "start" | "delta" | "stop";
  * Docs: /docs/omni-message § "origin: the Subagent chain".
  */
 export type MessageOrigin = string;
+
+/**
+ * Trace context carried by a protocol event. `trace_id` identifies the logical Trace root:
+ * a Goal Run in goal mode, or a standalone Task otherwise. Task and Step identity are
+ * additive because a Goal Trace contains multiple Tasks and every Task may contain multiple
+ * Steps. Lifecycle events carry the Span they open/close, while observation events carry the
+ * Span they occurred within.
+ *
+ * The envelope field is optional so unversioned injected inputs can be stamped at the SDK
+ * boundary. Protocol-v3 stored execution events always carry this context.
+ */
+export interface TraceContext {
+  trace_id: string;
+  task_id?: string;
+  step_id?: string;
+  span_id?: string;
+  parent_span_id?: string;
+  caused_by_event_id?: string;
+}
 
 /** The approval decision for a tool call. */
 export type ApprovalDecision = "allow" | "deny";
@@ -252,6 +272,85 @@ export interface PartialToolCallOutputPayload {
 // ---------------------------------------------------------------------------
 // Docs: /docs/omni-message § "event_msg"
 
+/** Execution Span kinds understood by the Trace protocol. */
+export type SpanKind =
+  | "agent.task"
+  | "agent.step"
+  | "llm.request"
+  | "llm.attempt"
+  | "tool.execute"
+  | "subagent.invoke"
+  | "memory.write"
+  | "knowledge.write";
+
+/** Operations a projected execution node may expose. */
+export interface SpanCapabilities {
+  editable_input: boolean;
+  repeatable: boolean;
+  rerunnable: boolean;
+  skippable: boolean;
+}
+
+/** Append-only start record for an execution Span. */
+export interface SpanBeginPayload {
+  type: "span_begin";
+  span_kind: SpanKind;
+  capabilities: SpanCapabilities;
+  /** Span-specific audit metadata such as input Event references or tool identity. */
+  attributes?: Record<string, unknown>;
+}
+
+/** Terminal state of an execution Span; Branch execution may close a bypassed Span as skipped. */
+export type SpanStatus = StopReason | "skipped";
+
+/** The logical Trace root: a multi-Task Goal Run, or one standalone Task. */
+export type TraceRootKind = "goal_run" | "task";
+
+/** Goal outcomes are normalized onto the execution status vocabulary at the Trace boundary. */
+export type TraceStatus = SpanStatus | "blocked" | "budget_limited";
+
+/** Opens one logical Trace root. Its identity lives in `trace.trace_id`. */
+export interface TraceBeginPayload {
+  type: "trace_begin";
+  root_kind: TraceRootKind;
+}
+
+/** Closes one logical Trace root. A missing record means the process stopped mid-Trace. */
+export interface TraceEndPayload {
+  type: "trace_end";
+  root_kind: TraceRootKind;
+  status: TraceStatus;
+  error_message?: string;
+}
+
+/** Append-only terminal record for an execution Span. */
+export interface SpanEndPayload {
+  type: "span_end";
+  span_kind: SpanKind;
+  status: SpanStatus;
+  error_message?: string;
+}
+
+/** Explicit semantic observations emitted by Agents and tools; never inferred from free text. */
+export type ObservationKind =
+  | "thinking"
+  | "planning"
+  | "verification"
+  | "evaluation"
+  | "output"
+  | "result"
+  | "progress"
+  | "memory"
+  | "knowledge";
+
+/** An inspectable fact inside an execution Span. */
+export interface ObservationPayload {
+  type: "observation";
+  kind: ObservationKind;
+  content?: string;
+  data?: Record<string, unknown>;
+}
+
 export interface ApprovalDecisionPayload {
   type: "approval_decision";
   decision: ApprovalDecision;
@@ -387,15 +486,17 @@ export interface GoalFinishedPayload {
 /**
  * Subagent pointer event: when the parent Session spawns a
  * **direct** child session, `context_engine` writes this to the parent Trace (not streamed),
- * recording only the child session's Session id — the child session's other details live in its
- * own Trace's `session_meta`. When the session is reopened, the server uses this to recursively
- * expand the child Trace and reconstruct the `origin` chain; a grandchild session's pointer is
- * recorded by the child Trace itself.
+ * recording the child Session and, once its root begins, the exact child Trace/Task identity.
+ * The child execution events remain in the child Session's own Trace store.
  */
 export interface SubagentPayload {
   type: "subagent";
   /** The direct child session's Session id. */
   session_id: string;
+  /** The child logical Trace root, when it has begun. */
+  trace_id?: string;
+  /** The child Task entered by this invocation, when known. */
+  task_id?: string;
 }
 
 /**
@@ -481,6 +582,11 @@ export type PartialModelPayload =
 export type ModelPayload = CompleteModelPayload | PartialModelPayload;
 
 export type EventPayload =
+  | TraceBeginPayload
+  | TraceEndPayload
+  | SpanBeginPayload
+  | SpanEndPayload
+  | ObservationPayload
   | ApprovalDecisionPayload
   | AbortPayload
   | RequestBeginPayload
@@ -500,8 +606,14 @@ export type OmniPayload = SessionMetaPayload | ModelPayload | EventPayload;
 export interface OmniMessage<P extends OmniPayload = OmniPayload> {
   /** ISO 8601 UTC timestamp. */
   timestamp: string;
+  /** Protocol revision. Optional only at the input boundary before v3 stamping. */
+  protocol_version?: number;
+  /** Stable identity shared by the live stream and its persisted JSONL record. */
+  event_id?: string;
   type: OmniMessageType;
   payload: P;
+  /** Logical Trace/Task/Step ownership and causal Span context. */
+  trace?: TraceContext;
   /** Nested-origin marker: the chain of child Session ids ordered outer-to-inner; absent = from the main Session (see MessageOrigin). */
   origin?: MessageOrigin[];
 }

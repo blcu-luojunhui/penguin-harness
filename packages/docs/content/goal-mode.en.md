@@ -18,6 +18,11 @@ Start a goal from any of the three surfaces:
 
 In the SDK, goal mode is an option of the one `run` call — `session.run(input, { goal: { budget } })` — not a separate API: the input's text becomes the objective, rounds loop inside the call, and the stream's final message is a `goal_finished` event carrying the outcome.
 
+Protocol v3 records the whole invocation as one Goal Run logical Trace. Every round that actually
+starts is one nested Task, and each Task contains its own Agent Steps. A Goal can stop before its
+first round, so a zero-Task Goal Trace is valid; physical context compaction never creates a new
+Goal or Task identity. See [Sessions & Traces](/sessions-and-traces).
+
 ## The control file: GOAL.yaml
 
 The loop's state channel is a file at `<agent_dir>/scratchpad/<session_id>/GOAL.yaml` (sibling of the model's `PLAN.md` convention), created by the system when the goal starts:

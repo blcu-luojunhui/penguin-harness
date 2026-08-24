@@ -13,7 +13,7 @@ This page shows the context_engine's overall flow first, then breaks down each s
 session.run(newMessages, { approve, signal })
   │  carry-over from a previous interrupt? → prepend to this run's input
   ▼
-┌── turn loop (≤ max_turns; default -1 = no cap) ───────────────┐
+┌── Agent Step loop (≤ max_turns; default -1 = no cap) ────────┐
 │                                                               │
 │  request_begin                                                │
 │  LLM.streamGenerate(newMessages)                              │
@@ -25,15 +25,15 @@ session.run(newMessages, { approve, signal })
 │    │     Environment.executeTool ──► runs concurrently,       │
 │    │                                 output streams back      │
 │    └─ LLMOutcome:                                             │
-│    failed/timeout/malformed ──► reconnect within the turn     │
+│    failed/timeout/malformed ──► new Attempt in the Request    │
 │                    (≤5, with [turn_retried]; tools not rerun) │
 │  token_usage + request_end (at LLM-stream end; not waiting   │
 │                              for tools)                       │
 │                                                               │
-│  tool outputs reordered to original call order ──► next turn  │
-│  no tool_call this turn? ──► Task ends, run returns           │
+│  tool outputs reordered to original call order ──► next Step  │
+│  no tool_call this Step? ──► Task ends, run returns           │
 │  compaction trigger (context/turns)? ──► summarize/discard    │
-│                                          + Trace rotation     │
+│                                          + Context checkpoint │
 └───────────────────────────────────────────────────────────────┘
 
 signal fires (any point) ──► emit abort + build carry-over ──► run returns
@@ -63,18 +63,26 @@ interface RunOptions {
 }
 ```
 
-## Lifecycle of a turn
+## Lifecycle of an Agent Step
 
-A Task consists of consecutive Requests (turns). Each turn:
+A Task consists of consecutive Agent Steps. Each Step is an explicit `agent.step` Span containing
+one logical `llm.request` Span; automatic reconnects create separate `llm.attempt` child Spans
+inside that Request. The older `request_begin` / `request_end` pair remains the physical Attempt
+boundary used to determine committed provider history. Each Step:
 
-1. emits `request_begin`;
+1. opens `agent.step`, `llm.request`, and the first `llm.attempt`, then emits `request_begin`;
 2. the LLM streams back: `partial_*` fragments followed by complete messages;
 3. every complete `tool_call` triggers exactly one `approve` callback; the decision is recorded as an `approval_decision` event;
-4. approved calls run **concurrently** in the Environment (approvals themselves are one at a time); outputs stream out in completion order;
-5. when the LLM stream ends, its final `token_usage` is emitted and `request_end(status)` follows at once — **without waiting for tools**: still-running tools may emit output after `request_end`;
-6. once the whole batch is terminal, tool results are **reordered to the original call order** and become the next turn's input — the next Request never fires before that.
+4. approved calls run **concurrently** in the Environment as sibling `tool.execute` (or `subagent.invoke`) Spans under the Step; approvals themselves remain serial, and outputs stream in completion order;
+5. when the LLM stream ends, its final `token_usage`, `request_end(status)`, and `llm.attempt` end follow at once — **without waiting for tools**: still-running tool Spans may finish later;
+6. a retryable failure opens another `llm.attempt` under the same logical Request; otherwise the logical Request closes with the final Attempt while the Step keeps waiting for the whole tool batch;
+7. tool results are **reordered to the original call order**, then the Step closes. Those results become the next Step's input; that Step never opens before the batch is terminal.
 
-The Task ends when a turn produces no `tool_call`. A denial produces a synthetic `aborted` tool output ("Tool call denied by user.") that the model reacts to.
+Complete model messages and explicit semantic observations carry their owning Attempt or Tool Span
+in the OmniMessage Trace context. A tool Span points back to its `tool_call` proposal through
+`caused_by_event_id`; no renderer has to infer the edge from timestamps or text. The Task ends when
+a Step produces no `tool_call`. A denial produces a synthetic `aborted` tool output ("Tool call
+denied by user.") that the model reacts to.
 
 ## Interruption and carry-over
 
@@ -126,9 +134,9 @@ Three triggers (`compaction_begin.reason`):
 | `turns` | Session turn count ≥ `maxSessionTurns` (default -1 = unlimited) |
 | `manual` | the user runs `/compact` or calls `session.compact()` |
 
-Two modes: `summarize` (default) appends the compaction Prompt to the old context, extracts the `[summary]`, wraps it as a `[context_summary]` user text and continues in a **fresh model context**; `discard` simply drops the old context. System markers are written as `[tag]…[/tag]`; the earlier angle-bracket form (`<summary>`, `<context_summary>`, …) is still recognized when reading old Traces and old persisted compaction prompts. Summary extraction applies a tolerance ladder: the first non-empty `[summary]` tag pair wins; when every pair is empty, the text left after stripping the tags is used instead (rescuing models that write the body after the closing tag); with no tags at all, the whole output is used verbatim. Compaction rotates the [Trace file](/sessions-and-traces) (`_002`, `_003`, …) — one Trace file always equals one complete model context. `compactability()` probes feasibility before `session.compact()` (`ok | unsupported | empty | just_compacted`).
+Two modes: `summarize` (default) appends the compaction Prompt to the old context, extracts the `[summary]`, wraps it as a `[context_summary]` user text and continues in a **fresh model context**; `discard` simply drops the old context. System markers are written as `[tag]…[/tag]`; the earlier angle-bracket form (`<summary>`, `<context_summary>`, …) is still recognized when reading old persisted prompts. Summary extraction applies a tolerance ladder: the first non-empty `[summary]` tag pair wins; when every pair is empty, the text left after stripping the tags is used instead; with no tags at all, the whole output is used verbatim. Compaction keeps writing to the same logical Trace and publishes a [Context checkpoint](/sessions-and-traces) after a successful `compaction_end`. `compactability()` probes feasibility before `session.compact()` (`ok | unsupported | empty | just_compacted`).
 
-The compaction request keeps the session's toolset **unchanged** — the request prefix (tool list included) stays byte-identical to ordinary turns, so the provider's prompt cache remains valid at the moment the context is largest. Compaction still succeeds only with a valid summary: a response that calls a tool or whose extracted summary is empty counts as one more failed attempt — any tool calls are answered with synthesized failed outputs (keeping `tool_use`/`tool_result` pairing intact), and the resent request carries a corrective note ahead of the compaction Prompt (committed history can only be appended to; rewriting it would invalidate the prompt cache). Every failure — unusable summaries and the `failed`/`timeout`/`malformed` transport statuses alike — draws on the one reconnect budget and backoff ladder described under "Automatic reconnect" above; only `auth` stops the compaction at once. Once the budget is exhausted the compaction ends `failed`, keeping the original context and Trace file until the next trigger; `compaction_end` reuses the unified retry detail block — `attempt` (the final attempt's ordinal, failed attempts included) and, on failure, the last `error_message` detail (shown on the chat banner and the CLI line) — and a failed compaction also lands in the cost center as a `compaction_failed` error record. The first **committed** attempt — adopted or rejected — also absorbs whatever turn input was folded into the compaction request (mid-Task tool results, or the carry-over a manual `/compact` folds in) into the old context's history: retries resend only the repairs and the Prompt, and nothing resends the absorbed input afterwards.
+The compaction request keeps the session's toolset **unchanged** — the request prefix (tool list included) stays byte-identical to ordinary Agent Steps, so the provider's prompt cache remains valid at the moment the context is largest. Compaction still succeeds only with a valid summary: a response that calls a tool or whose extracted summary is empty counts as one more failed attempt — any tool calls are answered with synthesized failed outputs (keeping `tool_use`/`tool_result` pairing intact), and the resent request carries a corrective note ahead of the compaction Prompt (committed history can only be appended to; rewriting it would invalidate the prompt cache). Every failure — unusable summaries and the `failed`/`timeout`/`malformed` transport statuses alike — draws on the one reconnect budget and backoff ladder described under "Automatic reconnect" above; only `auth` stops the compaction at once. Once the budget is exhausted the compaction ends `failed`, keeping the original Context until the next trigger; `compaction_end` reuses the unified retry detail block — `attempt` (the final attempt's ordinal, failed attempts included) and, on failure, the last `error_message` detail (shown on the chat banner and the CLI line) — and a failed compaction also lands in the cost center as a `compaction_failed` error record. The first **committed** attempt — adopted or rejected — also absorbs whatever Step input was folded into the compaction request (mid-Task tool results, or the carry-over a manual `/compact` folds in) into the old context's history: retries resend only the repairs and the Prompt, and nothing resends the absorbed input afterwards.
 
 An abandoned compaction is **made up later**, never patched over. Mid-Task the run ends the way any interruption does: the turn's still-pending state is held as carry-over under the same committed/not-committed rule, an `abort` event closes the run, and the next message resends that carry-over merged with the user's input — where the still-standing threshold triggers the compaction again. At a Task boundary the run simply ends with the original context kept. Either way nothing synthetic is invented to keep the loop running on a context that was supposed to shrink.
 
@@ -140,7 +148,7 @@ A compaction the user quit out of — the process died mid-request, leaving a `c
 
 ## Concurrency model
 
-- Within a turn: approvals are sequential, execution is concurrent, and the next turn's input keeps the original order;
+- Within an Agent Step: approvals are sequential, execution is concurrent, and the next Step's input keeps the original order;
 - within a Session: only one Task or one compaction runs at a time (the Server rejects concurrent requests with 409);
 - a [Subagent](/tools) is an independent Session with its own Trace and loop; its messages are forwarded to the parent tagged with `origin`.
 

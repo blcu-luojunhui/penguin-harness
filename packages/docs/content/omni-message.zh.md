@@ -14,17 +14,34 @@ OmniMessage 是 PenguinHarness 的统一消息协议：SDK 对外产出它，Tra
 ```ts
 interface OmniMessage<P extends OmniPayload = OmniPayload> {
   timestamp: string;        // ISO 8601 UTC
+  protocol_version?: number;// 新 builder 固定写 3；旧记录缺省
+  event_id?: string;        // 稳定 UUID，实时流与 Trace 中保持不变
   type: "session_meta" | "model_msg" | "event_msg";
   payload: P;
+  trace?: TraceContext;     // 逻辑 Trace / Task / Step 归属与因果关系
   origin?: string[];        // 子 Session 链(由外到内);缺省表示主 Session
 }
+
+interface TraceContext {
+  trace_id: string;         // Goal Run 或独立 Task 根
+  task_id?: string;         // 根内的 Task
+  step_id?: string;         // Task 内的一次 Agent Step
+  span_id?: string;         // 此 Event 所属的 Span
+  parent_span_id?: string;  // 生命周期 Event 的执行层级
+  caused_by_event_id?: string; // 因果 Event，如工具提议 → 工具执行
+}
 ```
+
+内置 builder 新建的每条消息都带 `protocol_version: 3` 和不透明的 `event_id`。TypeScript
+接口把它们保留为可选字段，只是为了能读取已有 Trace 或 SDK 传入的旧形状消息。身份由生产者在实时
+发送和持久化之前生成；Trace Writer 不会重新分配。协议 v3 的执行记录落盘时都携带 `trace`；
+`session_meta` 等 Session fact 不携带。
 
 三类消息的分工：
 
 | type | 含义 | 数量级 |
 | --- | --- | --- |
-| `session_meta` | 一个模型上下文的完整运行配置 | 每个上下文恰好一条 |
+| `session_meta` | 一个 Session 的不可变运行配置 | 每个 Session 恰好一条 |
 | `model_msg` | 模型上下文中的内容消息(文本、思考、工具调用与结果) | 主体 |
 | `event_msg` | 上下文之外的运行事件(审批、用量、压缩、中断) | 伴随 |
 
@@ -43,7 +60,7 @@ interface SessionMetaPayload {
 }
 ```
 
-session_meta 只承载**会话级不变量**——模型、系统提示词、Workspace 在 Session 生命周期内不可变；恢复 Session 时引擎直接以 Trace 中的这条消息为运行时配置，见 [Session 与 Trace](/sessions-and-traces)。思考等级是逐轮参数（随每次 Task 下发），不记录在此；旧版 Trace 的 meta 里可能仍带 `thinking_level` 字段，恢复时会被忽略——恢复后的 Session 直接读取 Agent 当前配置。
+session_meta 只承载**会话级不变量**——模型、系统提示词、Workspace 在 Session 生命周期内不可变；恢复 Session 时引擎直接以 Session journal 中第一条此类 fact 为运行时配置，见 [Session 与 Trace](/sessions-and-traces)。思考等级是逐次运行参数（随每次 Task 下发），不记录在此；旧版 Trace 的 meta 里可能仍带 `thinking_level` 字段，恢复时会被忽略——恢复后的 Session 直接读取 Agent 当前配置。
 
 工具 schema **不在 meta 里**：工具集要等 MCP Server 连接完成才可知，而 meta 不应等待——完整工具定义在首次 run 时以独立的 `tool_list_ready` 事件下发（见 event_msg）。拆分前的旧版 Trace 在 meta 里内嵌 `tools` 字段，该字段已明确不再读取（旧 Trace 的工具记录不再展示）。
 
@@ -115,7 +132,7 @@ interface InlineDataPayload {
 }
 ```
 
-`tool_call` 与 `tool_call_output` 通过 `tool_call_id` 严格配对；一轮内的多个调用是一个批次，输出按原始调用顺序回填(见 [Agent 运行循环](/agent-loop))。
+`tool_call` 与 `tool_call_output` 通过 `tool_call_id` 严格配对；一个 Agent Step 内的多个调用是一个批次，输出按原始调用顺序回填(见 [Agent 运行循环](/agent-loop))。
 
 ## model_msg：流式分片
 
@@ -174,14 +191,74 @@ partial_text(start) → partial_text(delta) → … → partial_text(stop) → t
 
 ## event_msg
 
-十一种事件 payload，全部逐字段列出：
+生命周期 Event 通过追加式记录物化执行 Span。语义观察必须由显式 Event 提供；渲染器不能从自由
+文本推断规划、验证或评估。其后仍是既有的控制与统计 Event。
 
 ```ts
+type SpanKind =
+  | "agent.task"
+  | "agent.step"
+  | "llm.request"
+  | "llm.attempt"
+  | "tool.execute"
+  | "subagent.invoke"
+  | "memory.write"
+  | "knowledge.write";
+
+type TraceRootKind = "goal_run" | "task";
+type TraceStatus = StopReason | "skipped" | "blocked" | "budget_limited";
+
+interface TraceBeginPayload {
+  type: "trace_begin";
+  root_kind: TraceRootKind;
+}
+
+interface TraceEndPayload {
+  type: "trace_end";
+  root_kind: TraceRootKind;
+  status: TraceStatus;
+  error_message?: string;
+}
+
+interface SpanBeginPayload {
+  type: "span_begin";
+  span_kind: SpanKind;
+  capabilities: {
+    editable_input: boolean;
+    repeatable: boolean;
+    rerunnable: boolean;
+    skippable: boolean;
+  };
+  attributes?: Record<string, unknown>; // 输入 Event 引用、Attempt/工具身份等
+}
+
+interface SpanEndPayload {
+  type: "span_end";
+  span_kind: SpanKind;
+  status: StopReason | "skipped";
+  error_message?: string;
+}
+
+interface ObservationPayload {
+  type: "observation";
+  kind:
+    | "thinking"
+    | "planning"
+    | "verification"
+    | "evaluation"
+    | "output"
+    | "result"
+    | "progress"
+    | "memory"
+    | "knowledge";
+  content?: string;
+  data?: Record<string, unknown>;
+}
+
 interface ToolListReadyPayload {
   type: "tool_list_ready";
-  tools: ToolDefinition[];    // 发给模型的完整工具 schema;首次 run 时发出一次(MCP 发现
-                              // 完成后),Trace 中写在本轮输入之后(归属新轮次),压缩分卷时
-                              // 随 session_meta 一并重写到新 Trace 文件
+  tools: ToolDefinition[];    // MCP 发现完成后发出的完整工具 schema，作为 Session fact
+                              // 持久化；上下文压缩不会轮转或重写逻辑 Trace
 }
 
 interface ToolDefinition {
@@ -338,7 +415,7 @@ Provider 专有的线上数据统一收拢在一个可选字段 `fidelity` 中�
 | 场景 | 使用的子集 |
 | --- | --- |
 | SDK 边界(`session.run` 输出) | 完整 `model_msg` + 流式 `partial_*` + 全部 `event_msg` |
-| Trace 落盘 | `session_meta` + 完整 `model_msg` + 全部 `event_msg`(不存分片与 `origin` 消息) |
+| Trace 落盘 | Session fact 写入 `session.jsonl`；带作用域的完整 `model_msg` 与 `event_msg` 写入各逻辑 Trace 的 `events.jsonl`（不存分片与转发的 `origin` 消息） |
 | Server SSE 推送 | 与 SDK 边界一致，原样单行 JSON，见 [Server API](/server-api) |
 
 消息沿这些通道传递的机制与顺序保证，见[消息流转与时序](/message-flow)。

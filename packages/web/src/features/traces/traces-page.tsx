@@ -52,14 +52,16 @@ import { useSessions } from "../../state/sessions";
 import { EmptyState } from "../../components/ui/empty-state";
 import { SkeletonList } from "../../components/ui/skeleton";
 import { TraceFileView } from "./trace-file-view";
+import { LogicalTraceExplorer } from "./trace-step-explorer";
 import type { TraceHighlight } from "./timeline-chart";
 import {
   TRACES_GROUP_PAGE_SIZE,
   TRACES_PAGE_SIZE,
+  logicalTraceSelection,
   partitionTraceRows,
   toSessionGroups,
 } from "./trace-sessions";
-import type { TraceFileRef, TraceSessionRow } from "./trace-sessions";
+import type { TraceSessionRow, TraceSessionSelection } from "./trace-sessions";
 import { useTraceTree } from "./use-trace-tree";
 
 /**
@@ -76,24 +78,15 @@ const FILE_PILL_CAP = 10;
 /** Open-state key of a collapsed folder inside a group ("\0" never appears in Agent ids or Workspace paths — the sidebar's composite). */
 const folderKey = (groupKey: string, category: FolderCategory) => `${category}\0${groupKey}`;
 
-interface Selection {
-  /** Details go through the Agent-level endpoint (not dependent on the sessions table's tracking), so the owning Agent must be carried along. */
-  agentId: string;
-  sessionId: string;
-  /** Server-resolved title of the selected group (the header still prefers a fresher store title). */
-  title?: string;
-  files: TraceFileRef[];
-}
-
 export function TracesPage() {
   useDocumentTitle(S.traces.title);
   const { currentProject, agents, agentsLoading } = useProject();
   // showCliSessions: the traces tree follows the same per-user "show CLI sessions"
   // preference as the sidebar (default off) — CLI-origin Sessions are excluded
   // server-side from the listing, counts and workspace groups until it is enabled.
-  // A deep link to a CLI Session still resolves while the preference is off: the
-  // selection fallback (selectFromFull) uses the unfiltered legacy endpoint, so the
-  // Session opens in the right pane without appearing in the tree.
+  // A deep link to a CLI Session still resolves while the preference is off. V3
+  // Sessions are identified through their roots endpoint and do not depend on the
+  // legacy unpaged file listing.
   const { byAgent, showCliSessions } = useSessions();
   const projectId = currentProject?.projectId ?? null;
   const tree = useTraceTree(projectId, showCliSessions);
@@ -105,11 +98,13 @@ export function TracesPage() {
   // ?sessionId= deep link (jumped to directly from the evaluation center's
   // runs): auto-selects once the target Agent's Session list is ready.
   const focusSessionId = searchParams.get("sessionId");
+  const focusTraceId = searchParams.get("traceId");
+  const focusTaskId = searchParams.get("taskId");
   // Grouping mode: the same persisted preference as the chat sidebar
   // (penguin.sidebarGroupMode) so the two surfaces always group alike.
   const [modePref, setModePref] = useState<GroupMode>(initialGroupMode);
   const groupMode: GroupMode = focusAgentId !== null ? "agent" : modePref;
-  const [selection, setSelection] = useState<Selection | null>(null);
+  const [selection, setSelection] = useState<TraceSessionSelection | null>(null);
   const [fileIndex, setFileIndex] = useState<number | null>(null);
   /** Rendered groups cap (the sidebar's group paging pattern: raised a page per "more groups" click; reset per Project and on a mode switch). */
   const [groupCap, setGroupCap] = useState(TRACES_GROUP_PAGE_SIZE);
@@ -284,10 +279,30 @@ export function TracesPage() {
     [projectId, select],
   );
 
+  /** Resolve a hidden/unpaged deep link without making v3 depend on the legacy file list. */
+  const selectDeepLinkedSession = useCallback(
+    (agentId: string, sessionId: string) => {
+      if (!projectId) return;
+      api
+        .getAgentTraceRoots(projectId, agentId, sessionId)
+        .then((inventory) => {
+          const logicalSelection = logicalTraceSelection(agentId, sessionId, inventory);
+          if (logicalSelection !== null) {
+            setSelection(logicalSelection);
+            setFileIndex(null);
+          } else {
+            selectFromFull(agentId, sessionId);
+          }
+        })
+        .catch(() => selectFromFull(agentId, sessionId));
+    },
+    [projectId, selectFromFull],
+  );
+
   // The Session deep link is applied only once: it selects the target as soon as the
-  // target Agent's first page is ready (falling back to a full fetch when the target
-  // sorts beyond it or lives in a folder category); after that, the user's manual
-  // switches are never pulled back by the deep-link parameter.
+  // target Agent's first page is ready. A missing row is probed through the roots API;
+  // only an unsupported or failed probe falls back to the full file list.
+  // After that, manual switches are never pulled back by the deep-link parameter.
   const focusApplied = useRef(false);
   useEffect(() => {
     if (focusApplied.current || !focusSessionId || !focusAgentId) return;
@@ -295,8 +310,8 @@ export function TracesPage() {
     focusApplied.current = true;
     const target = tree.rowsByAgent.get(focusAgentId)?.find((g) => g.sessionId === focusSessionId);
     if (target) select(target);
-    else selectFromFull(focusAgentId, focusSessionId);
-  }, [tree, focusSessionId, focusAgentId, select, selectFromFull]);
+    else selectDeepLinkedSession(focusAgentId, focusSessionId);
+  }, [tree, focusSessionId, focusAgentId, select, selectDeepLinkedSession]);
 
   // Post-import selection: once the refreshed list is in, select the imported Session —
   // an import always creates a new Session whose only file is the imported one, so the
@@ -428,7 +443,11 @@ export function TracesPage() {
                     : "text-gray-700 dark:text-gray-300"
                 }`}
               />
-              <span className="shrink-0 font-mono text-[11px] text-gray-400">{r.files.length}</span>
+              {r.files.length > 0 && (
+                <span className="shrink-0 font-mono text-[11px] text-gray-400">
+                  {r.files.length}
+                </span>
+              )}
             </button>
           </li>
         );
@@ -689,73 +708,89 @@ export function TracesPage() {
       </aside>
 
       <section className="min-w-0 flex-1 overflow-y-auto p-3 md:p-4">
-        {selection && activeFile ? (
-          <div className="mx-auto max-w-4xl space-y-4">
-            {/* Header: Session title + Trace file pagination (newest first) */}
-            <div className="flex flex-wrap items-center gap-2">
-              <p className="min-w-0 flex-1 truncate text-sm font-semibold">
-                {titleOf(selection.sessionId, selection.title)}
-              </p>
-              <div className="flex flex-wrap items-center gap-1">
-                <span className="mr-1 text-xs text-gray-400">{S.traces.filesTitle}</span>
-                {(visibleFiles ?? selection.files).map((f) => (
-                  <button
-                    key={f.index}
-                    type="button"
-                    onClick={() => setFileIndex(f.index)}
-                    title={`${f.date} · ${formatBytes(f.sizeBytes)}`}
-                    className={`rounded-md border px-2 py-0.5 font-mono text-xs transition-colors duration-150 ${
-                      f.index === activeFile.index
-                        ? "border-gray-400 bg-gray-200/70 font-semibold text-gray-900 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
-                        : "border-gray-200 text-gray-500 hover:bg-gray-100 dark:border-gray-800 dark:text-gray-400 dark:hover:bg-gray-800/60"
-                    }`}
-                  >
-                    #{String(f.index).padStart(3, "0")}
-                  </button>
-                ))}
-                {/* Overflow control: reveals the remaining pills (styled like an inactive pill). */}
-                {visibleFiles !== null && selection.files.length > FILE_PILL_CAP && (
-                  <button
-                    type="button"
-                    title={S.chat.loadMore}
-                    aria-label={S.chat.loadMore}
-                    onClick={() => setShowAllFiles(true)}
-                    className="rounded-md border border-gray-200 px-2 py-0.5 font-mono text-xs text-gray-500 transition-colors duration-150 hover:bg-gray-100 dark:border-gray-800 dark:text-gray-400 dark:hover:bg-gray-800/60"
-                  >
-                    +{selection.files.length - FILE_PILL_CAP}
-                  </button>
-                )}
-              </div>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              {/* Date · size only — the session id stays in the data (selection, deep links) but never renders as text. */}
-              <p className="min-w-0 flex-1 truncate font-mono text-xs text-gray-400">
-                {activeFile.date} · {formatBytes(activeFile.sizeBytes)}
-              </p>
-              {/* Raw-file download for the selected Trace file (same styling as the inactive file pills). */}
-              <a
-                href={api.agentTraceDownloadUrl(
-                  projectId,
-                  selection.agentId,
-                  selection.sessionId,
-                  activeFile.index,
-                )}
-                download
-                className="inline-flex shrink-0 items-center gap-1 rounded-md border border-gray-200 px-2 py-0.5 text-xs text-gray-500 transition-colors duration-150 hover:bg-gray-100 dark:border-gray-800 dark:text-gray-400 dark:hover:bg-gray-800/60"
-              >
-                <DownloadIcon size={12} />
-                {S.traces.exportFile}
-              </a>
-            </div>
+        {selection ? (
+          <div className="mx-auto max-w-[96rem] space-y-4">
+            <p className="truncate text-sm font-semibold">
+              {titleOf(selection.sessionId, selection.title)}
+            </p>
 
-            <TraceFileView
+            <LogicalTraceExplorer
               projectId={projectId}
               agentId={selection.agentId}
               sessionId={selection.sessionId}
-              index={activeFile.index}
-              highlight={highlight}
-              onHighlight={setHighlight}
+              initialTraceId={
+                selection.agentId === focusAgentId && selection.sessionId === focusSessionId
+                  ? focusTraceId
+                  : null
+              }
+              initialTaskId={
+                selection.agentId === focusAgentId && selection.sessionId === focusSessionId
+                  ? focusTaskId
+                  : null
+              }
             />
+
+            {activeFile !== null && (
+              <>
+                {/* Physical JSONL shards remain a secondary legacy/audit surface. */}
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1">
+                    <span className="mr-1 text-xs text-gray-400">{S.traces.filesTitle}</span>
+                    {(visibleFiles ?? selection.files).map((f) => (
+                      <button
+                        key={f.index}
+                        type="button"
+                        onClick={() => setFileIndex(f.index)}
+                        title={`${f.date} · ${formatBytes(f.sizeBytes)}`}
+                        className={`rounded-md border px-2 py-0.5 font-mono text-xs transition-colors duration-150 ${
+                          f.index === activeFile.index
+                            ? "border-gray-400 bg-gray-200/70 font-semibold text-gray-900 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+                            : "border-gray-200 text-gray-500 hover:bg-gray-100 dark:border-gray-800 dark:text-gray-400 dark:hover:bg-gray-800/60"
+                        }`}
+                      >
+                        #{String(f.index).padStart(3, "0")}
+                      </button>
+                    ))}
+                    {visibleFiles !== null && selection.files.length > FILE_PILL_CAP && (
+                      <button
+                        type="button"
+                        title={S.chat.loadMore}
+                        aria-label={S.chat.loadMore}
+                        onClick={() => setShowAllFiles(true)}
+                        className="rounded-md border border-gray-200 px-2 py-0.5 font-mono text-xs text-gray-500 transition-colors duration-150 hover:bg-gray-100 dark:border-gray-800 dark:text-gray-400 dark:hover:bg-gray-800/60"
+                      >
+                        +{selection.files.length - FILE_PILL_CAP}
+                      </button>
+                    )}
+                  </div>
+                  <p className="truncate font-mono text-xs text-gray-400">
+                    {activeFile.date} · {formatBytes(activeFile.sizeBytes)}
+                  </p>
+                  <a
+                    href={api.agentTraceDownloadUrl(
+                      projectId,
+                      selection.agentId,
+                      selection.sessionId,
+                      activeFile.index,
+                    )}
+                    download
+                    className="inline-flex shrink-0 items-center gap-1 rounded-md border border-gray-200 px-2 py-0.5 text-xs text-gray-500 transition-colors duration-150 hover:bg-gray-100 dark:border-gray-800 dark:text-gray-400 dark:hover:bg-gray-800/60"
+                  >
+                    <DownloadIcon size={12} />
+                    {S.traces.exportFile}
+                  </a>
+                </div>
+
+                <TraceFileView
+                  projectId={projectId}
+                  agentId={selection.agentId}
+                  sessionId={selection.sessionId}
+                  index={activeFile.index}
+                  highlight={highlight}
+                  onHighlight={setHighlight}
+                />
+              </>
+            )}
           </div>
         ) : (
           <EmptyState title={S.traces.selectSession} />

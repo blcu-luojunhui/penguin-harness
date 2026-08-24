@@ -30,7 +30,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {
   createAgent,
-  findLatestTraceFile,
+  findV3Session,
   goalFinishedOf,
   goalTokenDelta,
   isGoalRoundInput,
@@ -160,7 +160,7 @@ export function createCoreSessionLoader(
         agentId: row.agentId,
         ...(opts.proxyEnv ? { proxyEnv: opts.proxyEnv } : {}),
       });
-      const located = await findLatestTraceFile(
+      const located = await findV3Session(
         tracesDir(root, row.projectId, row.agentId),
         row.sessionId,
       );
